@@ -13,9 +13,9 @@ Every clipboard sync product wants an account, a subscription, or your data on s
 
 ## What you get
 
-* **Windows tray app.** Lives in the taskbar corner. Right click: send your clipboard to the Mac or to your iPhone, fetch the latest clip, or toggle auto fetch.
-* **Mac menu bar app.** A native clipboard icon in the menu bar. Right click: send your clipboard to the PC, fetch, or toggle auto fetch.
-* **Instant sends.** "Send to Mac" and "Send to PC" push whatever is on your clipboard the moment you click them. No dialog, no paste step, no extra clicks.
+* **Windows tray app.** Lives in the taskbar corner. Left click sends your clipboard straight to the Mac. Right click for the menu: send to iPhone, fetch the latest clip, or toggle auto fetch.
+* **Mac menu bar app.** A native clipboard icon in the menu bar. Left click sends your clipboard straight to the PC. Right click for the menu.
+* **Instant sends.** Every send pushes whatever is on your clipboard the moment you click. No dialog, no paste step, no extra clicks.
 * **Instant receives.** Auto fetch polls quietly in the background. When a clip arrives it lands directly on your clipboard and you get a native notification telling you what it was and where it came from.
 * **Selective by design.** Nothing syncs until you press send. Your clipboard is not streamed anywhere; only the clips you choose to share ever leave the machine.
 * **iPhone too (optional).** A database trigger pings your phone through the free Bark app, and one tap runs an iOS Shortcut that pulls the clip onto your iPhone clipboard. Sending from the phone is a Shortcut as well.

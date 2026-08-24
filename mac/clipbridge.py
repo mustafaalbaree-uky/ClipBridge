@@ -3,7 +3,10 @@ ClipBridge, Mac menu bar client.
 
 Polls the shared Supabase table for clips addressed to this Mac, copies
 them to the clipboard, and shows a notification. Sending is instant:
-"Send to PC" pushes whatever is on the clipboard right now, no dialog.
+whatever is on the clipboard right now goes out, no dialog.
+
+Left click on the menu bar icon: send the clipboard to the PC.
+Right click (or control click): open the menu.
 
 Menu:
     Send to PC   push the current clipboard to the PC, instantly
@@ -26,6 +29,15 @@ from pathlib import Path
 
 import rumps
 import requests
+
+try:
+    import objc
+    from Foundation import NSObject, NSMakePoint
+    from AppKit import (NSApp, NSEventTypeRightMouseUp, NSEventMaskLeftMouseUp,
+                        NSEventMaskRightMouseUp, NSEventModifierFlagControl)
+    HAS_APPKIT = True
+except Exception:
+    HAS_APPKIT = False
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -63,12 +75,31 @@ POLL_SEC     = int(_cfg.get('poll_seconds', 3))
 
 def _make_icon_path():
     """Render the SF Symbol clipboard icon to a temp PNG so rumps can use
-    it as a template image (adapts to light and dark menu bars)."""
+    it as a template image (adapts to light and dark menu bars).
+
+    The symbol's native raster is tiny, which looked blurry once the menu
+    bar scaled it up on retina screens, so draw the vector symbol into a
+    large image first and let rumps scale it down."""
     try:
         from AppKit import NSImage, NSBitmapImageRep
         img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
             'doc.on.clipboard', 'ClipBridge')
-        tiff = img.TIFFRepresentation()
+        try:
+            from AppKit import NSImageSymbolConfiguration
+            cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                40.0, 0.0)
+            img = img.imageWithSymbolConfiguration_(cfg)
+        except Exception:
+            pass
+        w, h = img.size().width, img.size().height
+        scale = 40.0 / max(w, h, 1)
+        W, H = max(1, round(w * scale)), max(1, round(h * scale))
+        out = NSImage.alloc().initWithSize_((W, H))
+        out.lockFocus()
+        img.drawInRect_fromRect_operation_fraction_(
+            ((0, 0), (W, H)), ((0, 0), (0, 0)), 2, 1.0)  # 2 = source over
+        out.unlockFocus()
+        tiff = out.TIFFRepresentation()
         rep  = NSBitmapImageRep.imageRepWithData_(tiff)
         data = rep.representationUsingType_properties_(4, {})  # 4 = PNG
         path = tempfile.mktemp(suffix='Template.png')
@@ -138,6 +169,25 @@ def _notify(message, title='Clip from PC'):
         f'display notification "{preview}" with title "{title}"'])
 
 
+# ── Click routing ──────────────────────────────────────────────────────────────
+# rumps attaches the menu to the status item, which makes every click open
+# it. To get "left click sends, right click opens the menu" we detach the
+# menu after launch, point the status button's action at ourselves, and pop
+# the menu up manually only for right clicks.
+
+if HAS_APPKIT:
+    class _StatusButtonHandler(NSObject):
+        def initWithOwner_(self, owner):
+            self = objc.super(_StatusButtonHandler, self).init()
+            if self is None:
+                return None
+            self._owner = owner
+            return self
+
+        def statusItemClicked_(self, sender):
+            self._owner._handle_status_click()
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 
 class ClipBridge(rumps.App):
@@ -157,6 +207,60 @@ class ClipBridge(rumps.App):
         self._seeded  = False
         self._auto    = True
         threading.Thread(target=self._poll, daemon=True).start()
+        if HAS_APPKIT:
+            self._nsmenu       = None
+            self._handler      = None
+            self._wire_tries   = 0
+            self._wire_timer   = rumps.Timer(self._wire_click, 0.5)
+            self._wire_timer.start()
+
+    def _wire_click(self, timer=None):
+        """Runs on the main thread shortly after launch, once the status
+        item exists. Falls back to normal rumps behavior if it cannot."""
+        self._wire_tries += 1
+        try:
+            item = self._nsapp.nsstatusitem
+            btn  = item.button()
+            if btn is None:
+                raise RuntimeError('status button not ready')
+            self._handler = _StatusButtonHandler.alloc().initWithOwner_(self)
+            btn.setTarget_(self._handler)
+            btn.setAction_('statusItemClicked:')
+            btn.sendActionOn_(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)
+            self._nsmenu = item.menu()
+            item.setMenu_(None)
+            self._wire_timer.stop()
+        except Exception:
+            if self._wire_tries >= 20:
+                self._wire_timer.stop()
+
+    def _handle_status_click(self):
+        is_right = False
+        try:
+            event = NSApp.currentEvent()
+            if event is not None:
+                if event.type() == NSEventTypeRightMouseUp:
+                    is_right = True
+                elif event.modifierFlags() & NSEventModifierFlagControl:
+                    is_right = True
+        except Exception:
+            is_right = True
+        if is_right:
+            self._pop_menu()
+        else:
+            self._send_to_pc(None)
+
+    def _pop_menu(self):
+        try:
+            item = self._nsapp.nsstatusitem
+            btn  = item.button()
+            self._nsmenu.popUpMenuPositioningItem_atLocation_inView_(
+                None, NSMakePoint(0, btn.bounds().size.height + 4), btn)
+        except Exception:
+            try:
+                self._nsapp.nsstatusitem.popUpStatusItemMenu_(self._nsmenu)
+            except Exception:
+                pass
 
     def _poll(self):
         while True:

@@ -4,6 +4,8 @@ ClipBridge, Windows tray client.
 Sits in the system tray and keeps this PC's clipboard in sync with the
 other devices through a shared Supabase table.
 
+Left click on the tray icon: send the current clipboard to the Mac.
+
 Right click menu:
     Auto: ON/OFF     toggle background polling for incoming clips
     Fetch Now        one shot fetch of the latest incoming clip
@@ -11,9 +13,6 @@ Right click menu:
     Send to iPhone   push the current clipboard to the iPhone, instantly
     Record Note      (only when a transcription worker is configured)
     Quit
-
-Left click deliberately does nothing, so a stray click never starts
-anything by accident.
 
 Config lives outside the repo, see config.example.json at the repo root.
 Search order: %USERPROFILE%/.clipbridge/config.json, then config.json
@@ -460,7 +459,8 @@ def _build_menu():
         MenuItem(lambda item: f'Auto: {"ON  " if _auto_mode else "OFF"}', _toggle_auto),
         MenuItem('Fetch Now', _fetch_now),
         MenuItem('Send to Mac',
-                 lambda icon, item: _send_clipboard('pc-to-mac', 'sent-mac')),
+                 lambda icon, item: _send_clipboard('pc-to-mac', 'sent-mac'),
+                 default=True),
         MenuItem('Send to iPhone',
                  lambda icon, item: _send_clipboard('pc', 'sent')),
     ]

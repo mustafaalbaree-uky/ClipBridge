@@ -19,7 +19,7 @@ Every clipboard sync product wants an account, a subscription, or your data on s
 * **Instant receives.** Auto fetch polls quietly in the background. When a clip arrives it lands directly on your clipboard and you get a native notification telling you what it was and where it came from.
 * **Selective by design.** Nothing syncs until you press send. Your clipboard is not streamed anywhere; only the clips you choose to share ever leave the machine.
 * **iPhone too (optional).** A database trigger pings your phone through the free Bark app, and one tap runs an iOS Shortcut that pulls the clip onto your iPhone clipboard. Sending from the phone is a Shortcut as well.
-* **Voice notes (optional).** Point the Windows client at a tiny Cloudflare Worker and a "Record Note" menu item appears: record, transcribe with Groq Whisper, and the text is on your clipboard and pushed to your other devices.
+* **Voice notes (optional).** Point either client at a tiny Cloudflare Worker and a "Record Note" item appears. On the Mac a global hotkey (default cmd+alt+r) toggles recording from anywhere: press it, speak, press it again, and the transcript is on your clipboard a moment later. Silences are truncated before upload, and long recordings are chopped at quiet moments and transcribed in parallel, so even a long note comes back fast. On Windows the transcript is also pushed to your other devices; on the Mac it stays local until you choose to send it.
 
 ## How it works
 
@@ -89,7 +89,11 @@ Now "Send to iPhone" on the PC rings your phone, and one tap puts the text on yo
 
 ### 5. Voice notes (optional)
 
-Deploy [`worker/transcribe-worker.js`](worker/transcribe-worker.js) to Cloudflare Workers with a `GROQ_API_KEY` secret, put the worker URL in your config as `transcribe_worker_url`, and restart the Windows client. A "Record Note" item appears in the tray menu.
+Deploy [`worker/transcribe-worker.js`](worker/transcribe-worker.js) to Cloudflare Workers with a `GROQ_API_KEY` secret, put the worker URL in your config as `transcribe_worker_url`, and restart the clients. A "Record Note" item appears in both menus, and on the Mac the global hotkey works too.
+
+The audio pipeline (in [`shared/noteproc.py`](shared/noteproc.py)) trims silences before upload, splits anything over three minutes into pieces cut at the quietest nearby moment so words are never sliced, transcribes the pieces in parallel, and retries transient failures with backoff.
+
+Mac permissions: the first recording asks for microphone access, and the global hotkey needs ClipBridge enabled under System Settings, Privacy and Security, Input Monitoring (or Accessibility on some macOS versions). The menu item works without it.
 
 ## Configuration
 
@@ -100,7 +104,8 @@ Deploy [`worker/transcribe-worker.js`](worker/transcribe-worker.js) to Cloudflar
 | `supabase_url` | yes | your Supabase project URL |
 | `supabase_anon_key` | yes | your Supabase anon key |
 | `poll_seconds` | no | auto fetch interval, default 3 |
-| `transcribe_worker_url` | no | enables Record Note on Windows |
+| `transcribe_worker_url` | no | enables Record Note on both clients |
+| `record_hotkey` | no | Mac recording toggle, default `<cmd>+<alt>+r` |
 
 ## Privacy
 

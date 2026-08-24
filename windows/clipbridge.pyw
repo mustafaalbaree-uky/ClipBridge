@@ -18,7 +18,6 @@ Config lives outside the repo, see config.example.json at the repo root.
 Search order: %USERPROFILE%/.clipbridge/config.json, then config.json
 next to the repo root.
 """
-import io
 import json
 import sys
 import threading
@@ -40,6 +39,12 @@ try:
     HAS_AUDIO = True
 except Exception:
     HAS_AUDIO = False
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared'))
+try:
+    import noteproc
+except Exception:
+    noteproc = None
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -80,7 +85,7 @@ POLL_SEC     = int(_cfg.get('poll_seconds', 3))
 WORKER_URL   = _cfg.get('transcribe_worker_url', '')
 SAMPLERATE   = 16000
 
-CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO
+CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
 
 # ── Palette ────────────────────────────────────────────────────────────────────
 BG      = '#1c1c1e'
@@ -418,26 +423,16 @@ def _on_stop_clicked():
 
 
 def _transcribe(audio):
-    buf = io.BytesIO()
-    sf.write(buf, audio, SAMPLERATE, format='WAV', subtype='PCM_16')
-    buf.seek(0)
+    # noteproc trims silences, chunks long audio at quiet points, and
+    # uploads chunks in parallel (same paradigm as ClipKeyboard on iPhone)
     try:
-        res = requests.post(
-            WORKER_URL,
-            files={'file': ('audio.wav', buf, 'audio/wav')},
-            data={'model': 'whisper-large-v3-turbo', 'language': 'en'},
-            timeout=30,
-        )
-        if res.ok:
-            text = res.json().get('text', '').strip()
-            if text:
-                _copy_to_clipboard(text)
-                _push_supabase(text)
-                _notify(text, source='recorded')
-            else:
-                _notify('', source='nothing')
+        text = noteproc.transcribe_note(audio, SAMPLERATE, WORKER_URL)
+        if text:
+            _copy_to_clipboard(text)
+            _push_supabase(text)
+            _notify(text, source='recorded')
         else:
-            _notify(f'Error {res.status_code}', source='error')
+            _notify('', source='nothing')
     except Exception as e:
         _notify(str(e), source='error')
     finally:

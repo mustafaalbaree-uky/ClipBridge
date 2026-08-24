@@ -7,12 +7,20 @@ whatever is on the clipboard right now goes out, no dialog.
 
 Left click on the menu bar icon: send the clipboard to the PC.
 Right click (or control click): open the menu.
+Global hotkey (default cmd+alt+r): toggle voice note recording. The
+recording starts the instant the stream opens, the same hotkey stops it,
+and the transcript lands on the clipboard only. Nothing is pushed to the
+other devices unless you send it afterwards.
 
 Menu:
-    Send to PC   push the current clipboard to the PC, instantly
-    Fetch Now    one shot fetch of the latest incoming clip
-    Auto: ON     toggle background polling
+    Send to PC       push the current clipboard to the PC, instantly
+    Fetch Now        one shot fetch of the latest incoming clip
+    Record Note      toggle recording (same as the hotkey)
+    Auto: ON         toggle background polling
     Quit
+
+Voice notes are processed by shared/noteproc.py: silences truncated,
+long audio chunked at quiet points and transcribed in parallel.
 
 Run directly:   .venv/bin/python3 clipbridge.py
 Build the app:  ./build.sh  (output: dist/ClipBridge.app)
@@ -22,6 +30,7 @@ the repo root. See config.example.json.
 """
 import json
 import subprocess
+import sys
 import threading
 import time
 import tempfile
@@ -35,9 +44,29 @@ try:
     from Foundation import NSObject, NSMakePoint
     from AppKit import (NSApp, NSEventTypeRightMouseUp, NSEventMaskLeftMouseUp,
                         NSEventMaskRightMouseUp, NSEventModifierFlagControl)
+    from PyObjCTools import AppHelper
     HAS_APPKIT = True
 except Exception:
     HAS_APPKIT = False
+
+try:
+    import numpy as np
+    import sounddevice as sd
+    HAS_AUDIO = True
+except Exception:
+    HAS_AUDIO = False
+
+try:
+    from pynput import keyboard as _pk
+    HAS_PYNPUT = True
+except Exception:
+    HAS_PYNPUT = False
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared'))
+try:
+    import noteproc
+except Exception:
+    noteproc = None
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -69,6 +98,11 @@ SUPA_URL     = _cfg['supabase_url'].rstrip('/')
 SUPA_ANON    = _cfg['supabase_anon_key']
 SUPA_HEADERS = {'apikey': SUPA_ANON, 'Authorization': f'Bearer {SUPA_ANON}'}
 POLL_SEC     = int(_cfg.get('poll_seconds', 3))
+WORKER_URL   = _cfg.get('transcribe_worker_url', '')
+HOTKEY       = _cfg.get('record_hotkey', '<cmd>+<alt>+r')
+SAMPLERATE   = 16000
+
+CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
 
 
 # ── Menu bar icon ──────────────────────────────────────────────────────────────
@@ -195,18 +229,35 @@ class ClipBridge(rumps.App):
         super().__init__('ClipBridge', icon=_ICON_PATH, template=True,
                          quit_button=None)
         self._auto_item = rumps.MenuItem('Auto: ON', callback=self._toggle_auto)
-        self.menu = [
+        items = [
             rumps.MenuItem('Send to PC', callback=self._send_to_pc),
             rumps.MenuItem('Fetch Now',  callback=self._fetch_now),
+        ]
+        if CAN_RECORD:
+            self._record_item = rumps.MenuItem('Record Note',
+                                               callback=self._toggle_record)
+            items += [None, self._record_item]
+        items += [
             None,
             self._auto_item,
             None,
             rumps.MenuItem('Quit', callback=lambda _: rumps.quit_application()),
         ]
+        self.menu = items
         self._last_id = None
         self._seeded  = False
         self._auto    = True
+        self._rec_on     = False
+        self._rec_frames = []
+        self._rec_stream = None
         threading.Thread(target=self._poll, daemon=True).start()
+        if CAN_RECORD and HAS_PYNPUT and HOTKEY:
+            try:
+                self._hotkeys = _pk.GlobalHotKeys({HOTKEY: self._hotkey_fired})
+                self._hotkeys.daemon = True
+                self._hotkeys.start()
+            except Exception:
+                pass
         if HAS_APPKIT:
             self._nsmenu       = None
             self._handler      = None
@@ -306,6 +357,94 @@ class ClipBridge(rumps.App):
             _notify(text if ok else 'Push failed.',
                     title='Sent to PC' if ok else 'ClipBridge')
         threading.Thread(target=_run, daemon=True).start()
+
+    # ── Voice notes ────────────────────────────────────────────────────────────
+
+    def _hotkey_fired(self):
+        # pynput calls from its listener thread; recording touches UI,
+        # so hop to the main thread
+        try:
+            AppHelper.callAfter(self._toggle_record, None)
+        except Exception:
+            self._toggle_record(None)
+
+    def _set_status_title(self, text, red=False):
+        def apply():
+            try:
+                btn = self._nsapp.nsstatusitem.button()
+                if not text:
+                    btn.setTitle_('')
+                elif red:
+                    from AppKit import NSColor, NSForegroundColorAttributeName
+                    from Foundation import NSAttributedString
+                    s = NSAttributedString.alloc().initWithString_attributes_(
+                        text,
+                        {NSForegroundColorAttributeName: NSColor.systemRedColor()})
+                    btn.setAttributedTitle_(s)
+                else:
+                    btn.setTitle_(text)
+            except Exception:
+                pass
+        try:
+            AppHelper.callAfter(apply)
+        except Exception:
+            apply()
+
+    def _toggle_record(self, _sender):
+        if not CAN_RECORD:
+            return
+        if not self._rec_on:
+            try:
+                self._rec_frames = []
+                self._rec_stream = sd.InputStream(
+                    samplerate=SAMPLERATE, channels=1, dtype='float32',
+                    callback=self._rec_callback)
+                self._rec_stream.start()
+            except Exception as e:
+                _notify(f'Could not open the microphone: {e}',
+                        title='ClipBridge')
+                self._rec_stream = None
+                return
+            self._rec_on = True
+            self._record_item.title = 'Stop Recording'
+            self._set_status_title(' ● REC', red=True)
+        else:
+            self._rec_on = False
+            try:
+                if self._rec_stream:
+                    self._rec_stream.stop()
+                    self._rec_stream.close()
+            except Exception:
+                pass
+            self._rec_stream = None
+            self._record_item.title = 'Record Note'
+            frames = self._rec_frames
+            self._rec_frames = []
+            if not frames:
+                self._set_status_title('')
+                _notify('Nothing recorded.', title='ClipBridge')
+                return
+            self._set_status_title(' …')
+            threading.Thread(target=self._transcribe, args=(frames,),
+                             daemon=True).start()
+
+    def _rec_callback(self, indata, frames, time_info, status):
+        if self._rec_on:
+            self._rec_frames.append(indata.copy())
+
+    def _transcribe(self, frames):
+        try:
+            audio = np.concatenate(frames, axis=0)
+            text = noteproc.transcribe_note(audio, SAMPLERATE, WORKER_URL)
+            if text:
+                _copy(text)
+                _notify(text, title='Note transcribed')
+            else:
+                _notify('Nothing heard.', title='ClipBridge')
+        except Exception as e:
+            _notify(str(e), title='ClipBridge')
+        finally:
+            self._set_status_title('')
 
 
 if __name__ == '__main__':

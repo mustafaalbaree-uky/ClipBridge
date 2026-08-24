@@ -1,0 +1,10 @@
+# Core clipboard sync
+requests
+pyperclip
+pystray
+Pillow
+
+# Optional, only needed for the Record Note feature
+numpy
+sounddevice
+soundfile

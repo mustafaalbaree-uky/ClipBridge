@@ -1,0 +1,10 @@
+config.json
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+mac/ClipBridge.icns
+mac/ClipBridge.iconset/
+.eggs/

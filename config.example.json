@@ -1,0 +1,6 @@
+{
+    "supabase_url": "https://YOUR-PROJECT.supabase.co",
+    "supabase_anon_key": "YOUR-SUPABASE-ANON-KEY",
+    "poll_seconds": 3,
+    "transcribe_worker_url": ""
+}

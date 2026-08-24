@@ -7,7 +7,7 @@ whatever is on the clipboard right now goes out, no dialog.
 
 Left click on the menu bar icon: send the clipboard to the PC.
 Right click (or control click): open the menu.
-Global hotkey (default cmd+alt+r): toggle voice note recording. The
+Global hotkey (default ctrl+alt+r): toggle voice note recording. The
 recording starts the instant the stream opens, the same hotkey stops it,
 and the transcript lands on the clipboard only. Nothing is pushed to the
 other devices unless you send it afterwards.
@@ -99,7 +99,7 @@ SUPA_ANON    = _cfg['supabase_anon_key']
 SUPA_HEADERS = {'apikey': SUPA_ANON, 'Authorization': f'Bearer {SUPA_ANON}'}
 POLL_SEC     = int(_cfg.get('poll_seconds', 3))
 WORKER_URL   = _cfg.get('transcribe_worker_url', '')
-HOTKEY       = _cfg.get('record_hotkey', '<cmd>+<alt>+r')
+HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+r')
 SAMPLERATE   = 16000
 
 CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
@@ -252,6 +252,14 @@ class ClipBridge(rumps.App):
         self._rec_stream = None
         threading.Thread(target=self._poll, daemon=True).start()
         if CAN_RECORD and HAS_PYNPUT and HOTKEY:
+            try:
+                # without Input Monitoring the listener runs but never hears
+                # a key; preflight so macOS shows its permission prompt once
+                import Quartz
+                if not Quartz.CGPreflightListenEventAccess():
+                    Quartz.CGRequestListenEventAccess()
+            except Exception:
+                pass
             try:
                 self._hotkeys = _pk.GlobalHotKeys({HOTKEY: self._hotkey_fired})
                 self._hotkeys.daemon = True

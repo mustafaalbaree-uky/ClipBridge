@@ -19,7 +19,7 @@ Every clipboard sync product wants an account, a subscription, or your data on s
 * **Instant receives.** Auto fetch polls quietly in the background. When a clip arrives it lands directly on your clipboard and you get a native notification telling you what it was and where it came from.
 * **Selective by design.** Nothing syncs until you press send. Your clipboard is not streamed anywhere; only the clips you choose to share ever leave the machine.
 * **iPhone too (optional).** A database trigger pings your phone through the free Bark app, and one tap runs an iOS Shortcut that pulls the clip onto your iPhone clipboard. Sending from the phone is a Shortcut as well.
-* **Voice notes (optional).** Point either client at a tiny Cloudflare Worker and a "Record Note" item appears. On the Mac a global hotkey (default cmd+alt+r) toggles recording from anywhere: press it, speak, press it again, and the transcript is on your clipboard a moment later. Silences are truncated before upload, and long recordings are chopped at quiet moments and transcribed in parallel, so even a long note comes back fast. On Windows the transcript is also pushed to your other devices; on the Mac it stays local until you choose to send it.
+* **Voice notes (optional).** Point either client at a tiny Cloudflare Worker and a "Record Note" item appears. On the Mac a global hotkey (default ctrl+alt+r) toggles recording from anywhere: press it, speak, press it again, and the transcript is on your clipboard a moment later. Silences are truncated before upload, and long recordings are chopped at quiet moments and transcribed in parallel, so even a long note comes back fast. On Windows the transcript is also pushed to your other devices; on the Mac it stays local until you choose to send it.
 
 ## How it works
 
@@ -105,7 +105,7 @@ Mac permissions: the first recording asks for microphone access, and the global 
 | `supabase_anon_key` | yes | your Supabase anon key |
 | `poll_seconds` | no | auto fetch interval, default 3 |
 | `transcribe_worker_url` | no | enables Record Note on both clients |
-| `record_hotkey` | no | Mac recording toggle, default `<cmd>+<alt>+r` |
+| `record_hotkey` | no | Mac recording toggle, default `<ctrl>+<alt>+r` |
 
 ## Privacy
 

@@ -3,5 +3,5 @@
     "supabase_anon_key": "YOUR-SUPABASE-ANON-KEY",
     "poll_seconds": 3,
     "transcribe_worker_url": "",
-    "record_hotkey": "<cmd>+<alt>+r"
+    "record_hotkey": "<ctrl>+<alt>+r"
 }

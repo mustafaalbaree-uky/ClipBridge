@@ -30,6 +30,12 @@ echo "Built dist/ClipBridge.app"
 if [ "${1:-}" = "--install" ]; then
     osascript -e 'quit app "ClipBridge"' 2>/dev/null || true
     sleep 1
+    # a polite quit can be ignored; make sure the old instance is really
+    # gone, or open -a will reactivate it instead of launching the new one
+    if pgrep -f "ClipBridge.app" >/dev/null; then
+        pkill -f "ClipBridge.app" || true
+        sleep 1
+    fi
     rm -rf "/Applications/ClipBridge.app"
     cp -R "dist/ClipBridge.app" /Applications/
     open -a ClipBridge

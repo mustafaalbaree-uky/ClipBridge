@@ -10,7 +10,7 @@ OPTIONS = {
     'argv_emulation': False,
     'packages': ['rumps', 'requests', 'certifi', 'urllib3', 'idna',
                  'charset_normalizer', 'numpy', 'sounddevice', 'soundfile',
-                 '_sounddevice_data', '_soundfile_data', 'pynput'],
+                 '_sounddevice_data', '_soundfile_data', 'quickmachotkey'],
     'includes': ['noteproc'],
     'plist': {
         'LSUIElement': True,

@@ -10,7 +10,10 @@ Right click (or control click): open the menu.
 Global hotkey (default ctrl+alt+r): toggle voice note recording. The
 recording starts the instant the stream opens, the same hotkey stops it,
 and the transcript lands on the clipboard only. Nothing is pushed to the
-other devices unless you send it afterwards.
+other devices unless you send it afterwards. The hotkey is registered
+through Carbon (RegisterEventHotKey), so it needs no Input Monitoring
+permission and works everywhere, including Terminal. While recording the
+menu bar icon becomes a red dot; while transcribing, an ellipsis.
 
 Menu:
     Send to PC       push the current clipboard to the PC, instantly
@@ -57,10 +60,14 @@ except Exception:
     HAS_AUDIO = False
 
 try:
-    from pynput import keyboard as _pk
-    HAS_PYNPUT = True
+    # Carbon hotkey registration: system level, needs no Input Monitoring
+    # permission, and keeps firing even in Terminal with Secure Keyboard
+    # Entry on (it is the same mechanism Spotlight's cmd+space uses)
+    from quickmachotkey import quickHotKey, mask as _hk_mask
+    import quickmachotkey.constants as _hk_const
+    HAS_HOTKEY = True
 except Exception:
-    HAS_PYNPUT = False
+    HAS_HOTKEY = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'shared'))
 try:
@@ -107,17 +114,27 @@ CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
 
 # ── Menu bar icon ──────────────────────────────────────────────────────────────
 
-def _make_icon_path():
-    """Render the SF Symbol clipboard icon to a temp PNG so rumps can use
-    it as a template image (adapts to light and dark menu bars).
+def _write_png(nsimage, suffix):
+    from AppKit import NSBitmapImageRep
+    tiff = nsimage.TIFFRepresentation()
+    rep  = NSBitmapImageRep.imageRepWithData_(tiff)
+    data = rep.representationUsingType_properties_(4, {})  # 4 = PNG
+    path = tempfile.mktemp(suffix=suffix)
+    data.writeToFile_atomically_(path, True)
+    return path
+
+
+def _render_symbol(name):
+    """Render an SF Symbol to a temp PNG so rumps can use it as a template
+    image (adapts to light and dark menu bars).
 
     The symbol's native raster is tiny, which looked blurry once the menu
     bar scaled it up on retina screens, so draw the vector symbol into a
     large image first and let rumps scale it down."""
     try:
-        from AppKit import NSImage, NSBitmapImageRep
+        from AppKit import NSImage
         img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            'doc.on.clipboard', 'ClipBridge')
+            name, 'ClipBridge')
         try:
             from AppKit import NSImageSymbolConfiguration
             cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
@@ -133,17 +150,30 @@ def _make_icon_path():
         img.drawInRect_fromRect_operation_fraction_(
             ((0, 0), (W, H)), ((0, 0), (0, 0)), 2, 1.0)  # 2 = source over
         out.unlockFocus()
-        tiff = out.TIFFRepresentation()
-        rep  = NSBitmapImageRep.imageRepWithData_(tiff)
-        data = rep.representationUsingType_properties_(4, {})  # 4 = PNG
-        path = tempfile.mktemp(suffix='Template.png')
-        data.writeToFile_atomically_(path, True)
-        return path
+        return _write_png(out, 'Template.png')
     except Exception:
         return None
 
 
-_ICON_PATH = _make_icon_path()
+def _render_record_dot():
+    """A red filled circle, shown as the menu bar icon while recording.
+    Not a template image, so it stays red in any menu bar theme."""
+    try:
+        from AppKit import NSImage, NSColor, NSBezierPath
+        S = 36
+        img = NSImage.alloc().initWithSize_((S, S))
+        img.lockFocus()
+        NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 0.27, 0.23, 1.0).set()
+        NSBezierPath.bezierPathWithOvalInRect_(((8, 8), (S - 16, S - 16))).fill()
+        img.unlockFocus()
+        return _write_png(img, 'Rec.png')
+    except Exception:
+        return None
+
+
+_ICON_PATH = _render_symbol('doc.on.clipboard')
+_BUSY_PATH = _render_symbol('ellipsis')
+_REC_PATH  = _render_record_dot()
 
 
 # ── Supabase ───────────────────────────────────────────────────────────────────
@@ -203,6 +233,29 @@ def _notify(message, title='Clip from PC'):
         f'display notification "{preview}" with title "{title}"'])
 
 
+def _parse_hotkey(spec):
+    """'<ctrl>+<alt>+r' -> (virtualKey, modifierMask), or None if the spec
+    is not understood. Letters, digits, and space are supported."""
+    mods = {'<cmd>': _hk_const.cmdKey, '<ctrl>': _hk_const.controlKey,
+            '<alt>': _hk_const.optionKey, '<opt>': _hk_const.optionKey,
+            '<shift>': _hk_const.shiftKey}
+    chosen = []
+    key = None
+    for tok in spec.lower().split('+'):
+        tok = tok.strip()
+        if tok in mods:
+            chosen.append(mods[tok])
+        elif tok == 'space':
+            key = _hk_const.kVK_Space
+        elif len(tok) == 1 and (tok.isalpha() or tok.isdigit()):
+            key = getattr(_hk_const, f'kVK_ANSI_{tok.upper()}', None)
+        else:
+            return None
+    if key is None or not chosen:
+        return None
+    return key, _hk_mask(*chosen)
+
+
 # ── Click routing ──────────────────────────────────────────────────────────────
 # rumps attaches the menu to the status item, which makes every click open
 # it. To get "left click sends, right click opens the menu" we detach the
@@ -251,19 +304,18 @@ class ClipBridge(rumps.App):
         self._rec_frames = []
         self._rec_stream = None
         threading.Thread(target=self._poll, daemon=True).start()
-        if CAN_RECORD and HAS_PYNPUT and HOTKEY:
+        self._hotkey_handle = None
+        if CAN_RECORD and HAS_HOTKEY and HOTKEY:
             try:
-                # without Input Monitoring the listener runs but never hears
-                # a key; preflight so macOS shows its permission prompt once
-                import Quartz
-                if not Quartz.CGPreflightListenEventAccess():
-                    Quartz.CGRequestListenEventAccess()
-            except Exception:
-                pass
-            try:
-                self._hotkeys = _pk.GlobalHotKeys({HOTKEY: self._hotkey_fired})
-                self._hotkeys.daemon = True
-                self._hotkeys.start()
+                parsed = _parse_hotkey(HOTKEY)
+                if parsed:
+                    vk, mods = parsed
+
+                    @quickHotKey(virtualKey=vk, modifierMask=mods)
+                    def _fire():
+                        self._hotkey_fired()
+
+                    self._hotkey_handle = _fire
             except Exception:
                 pass
         if HAS_APPKIT:
@@ -369,28 +421,27 @@ class ClipBridge(rumps.App):
     # ── Voice notes ────────────────────────────────────────────────────────────
 
     def _hotkey_fired(self):
-        # pynput calls from its listener thread; recording touches UI,
-        # so hop to the main thread
+        # recording touches UI, so make sure we are on the main thread
         try:
             AppHelper.callAfter(self._toggle_record, None)
         except Exception:
             self._toggle_record(None)
 
-    def _set_status_title(self, text, red=False):
+    def _set_state(self, state):
+        """Swap the menu bar icon: red dot while recording, ellipsis while
+        transcribing, the clipboard otherwise. No overlay text, so nothing
+        ever draws over neighboring menu bar items."""
         def apply():
             try:
-                btn = self._nsapp.nsstatusitem.button()
-                if not text:
-                    btn.setTitle_('')
-                elif red:
-                    from AppKit import NSColor, NSForegroundColorAttributeName
-                    from Foundation import NSAttributedString
-                    s = NSAttributedString.alloc().initWithString_attributes_(
-                        text,
-                        {NSForegroundColorAttributeName: NSColor.systemRedColor()})
-                    btn.setAttributedTitle_(s)
+                if state == 'rec' and _REC_PATH:
+                    self.template = False
+                    self.icon = _REC_PATH
+                elif state == 'busy' and _BUSY_PATH:
+                    self.template = True
+                    self.icon = _BUSY_PATH
                 else:
-                    btn.setTitle_(text)
+                    self.template = True
+                    self.icon = _ICON_PATH
             except Exception:
                 pass
         try:
@@ -415,7 +466,7 @@ class ClipBridge(rumps.App):
                 return
             self._rec_on = True
             self._record_item.title = 'Stop Recording'
-            self._set_status_title(' ● REC', red=True)
+            self._set_state('rec')
         else:
             self._rec_on = False
             try:
@@ -429,10 +480,10 @@ class ClipBridge(rumps.App):
             frames = self._rec_frames
             self._rec_frames = []
             if not frames:
-                self._set_status_title('')
+                self._set_state('idle')
                 _notify('Nothing recorded.', title='ClipBridge')
                 return
-            self._set_status_title(' …')
+            self._set_state('busy')
             threading.Thread(target=self._transcribe, args=(frames,),
                              daemon=True).start()
 
@@ -452,7 +503,7 @@ class ClipBridge(rumps.App):
         except Exception as e:
             _notify(str(e), title='ClipBridge')
         finally:
-            self._set_status_title('')
+            self._set_state('idle')
 
 
 if __name__ == '__main__':

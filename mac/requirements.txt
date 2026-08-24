@@ -4,4 +4,4 @@ py2app
 numpy
 sounddevice
 soundfile
-pynput
+quickmachotkey

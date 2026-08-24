@@ -93,7 +93,7 @@ Deploy [`worker/transcribe-worker.js`](worker/transcribe-worker.js) to Cloudflar
 
 The audio pipeline (in [`shared/noteproc.py`](shared/noteproc.py)) trims silences before upload, splits anything over three minutes into pieces cut at the quietest nearby moment so words are never sliced, transcribes the pieces in parallel, and retries transient failures with backoff.
 
-Mac permissions: the first recording asks for microphone access, and the global hotkey needs ClipBridge enabled under System Settings, Privacy and Security, Input Monitoring (or Accessibility on some macOS versions). The menu item works without it.
+Mac permissions: the first recording asks for microphone access, and that is the only permission involved. The hotkey registers through the system hotkey API (the one Spotlight uses), so it needs no Input Monitoring or Accessibility access and works in every app, Terminal included. While recording the menu bar icon turns into a red dot; while transcribing, an ellipsis.
 
 ## Configuration
 

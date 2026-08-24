@@ -53,7 +53,8 @@ def _load_config():
     for path in candidates:
         try:
             if path.is_file():
-                return json.loads(path.read_text(encoding='utf-8'))
+                # utf-8-sig also swallows the BOM Notepad likes to prepend
+                return json.loads(path.read_text(encoding='utf-8-sig'))
         except Exception:
             pass
     return None
@@ -61,13 +62,16 @@ def _load_config():
 
 _cfg = _load_config()
 if not _cfg or 'supabase_url' not in _cfg or 'supabase_anon_key' not in _cfg:
+    _expected = Path.home() / '.clipbridge' / 'config.json'
     _r = tk.Tk()
     _r.withdraw()
     messagebox.showerror(
         'ClipBridge',
         'No config found.\n\n'
-        'Copy config.example.json to ~/.clipbridge/config.json '
-        'and fill in your Supabase URL and anon key.')
+        f'Expected it at:\n{_expected}\n\n'
+        'Copy config.example.json there and fill in your Supabase URL '
+        'and anon key. Make sure the file is really named config.json, '
+        'not config.json.txt.')
     sys.exit(1)
 
 SUPA_URL     = _cfg['supabase_url'].rstrip('/')

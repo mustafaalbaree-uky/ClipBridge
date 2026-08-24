@@ -38,7 +38,8 @@ def _load_config():
     for path in candidates:
         try:
             if path.is_file():
-                return json.loads(path.read_text(encoding='utf-8'))
+                # utf-8-sig also swallows a BOM left by Windows editors
+                return json.loads(path.read_text(encoding='utf-8-sig'))
         except Exception:
             pass
     return None

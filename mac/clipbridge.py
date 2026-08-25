@@ -305,9 +305,15 @@ class ClipBridge(rumps.App):
         self._rec_stream = None
         threading.Thread(target=self._poll, daemon=True).start()
         self._hotkey_handle = None
+        diag = {
+            'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'can_record': CAN_RECORD, 'has_audio': HAS_AUDIO,
+            'has_hotkey_lib': HAS_HOTKEY, 'hotkey': HOTKEY,
+        }
         if CAN_RECORD and HAS_HOTKEY and HOTKEY:
             try:
                 parsed = _parse_hotkey(HOTKEY)
+                diag['parsed'] = repr(parsed)
                 if parsed:
                     vk, mods = parsed
 
@@ -316,8 +322,15 @@ class ClipBridge(rumps.App):
                         self._hotkey_fired()
 
                     self._hotkey_handle = _fire
-            except Exception:
-                pass
+                    diag['registered'] = True
+            except Exception as e:
+                import traceback
+                diag['register_error'] = traceback.format_exc()
+        try:
+            with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'w') as f:
+                json.dump(diag, f, indent=2)
+        except Exception:
+            pass
         if HAS_APPKIT:
             self._nsmenu       = None
             self._handler      = None
@@ -421,6 +434,11 @@ class ClipBridge(rumps.App):
     # ── Voice notes ────────────────────────────────────────────────────────────
 
     def _hotkey_fired(self):
+        try:
+            with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'a') as f:
+                f.write(f'\nhotkey fired {time.strftime("%H:%M:%S")}')
+        except Exception:
+            pass
         # recording touches UI, so make sure we are on the main thread
         try:
             AppHelper.callAfter(self._toggle_record, None)

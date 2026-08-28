@@ -9,8 +9,8 @@ APP = ['clipbridge.py']
 OPTIONS = {
     'argv_emulation': False,
     'packages': ['rumps', 'requests', 'certifi', 'urllib3', 'idna',
-                 'charset_normalizer', 'numpy', 'sounddevice', 'soundfile',
-                 '_sounddevice_data', '_soundfile_data', 'quickmachotkey'],
+                 'charset_normalizer', 'numpy', 'soundfile',
+                 '_soundfile_data', 'quickmachotkey', 'AVFoundation'],
     'includes': ['noteproc', 'hud'],
     'plist': {
         'LSUIElement': True,

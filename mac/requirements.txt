@@ -2,6 +2,6 @@ rumps
 requests
 py2app
 numpy
-sounddevice
+pyobjc-framework-AVFoundation
 soundfile
 quickmachotkey

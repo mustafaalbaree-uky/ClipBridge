@@ -7,18 +7,29 @@ whatever is on the clipboard right now goes out, no dialog.
 
 Left click on the menu bar icon: send the clipboard to the PC.
 Right click (or control click): open the menu.
-Global hotkey (default ctrl+alt+r): toggle voice note recording. The
+Global hotkey (default ctrl+alt+space): toggle voice note recording. The
 recording starts the instant the stream opens, the same hotkey stops it,
 and the transcript lands on the clipboard only. Nothing is pushed to the
 other devices unless you send it afterwards. The hotkey is registered
 through Carbon (RegisterEventHotKey), so it needs no Input Monitoring
 permission and works everywhere, including Terminal. While recording the
-menu bar icon becomes a red dot; while transcribing, an ellipsis.
+menu bar icon becomes a red dot; while transcribing, an ellipsis. A small
+on screen pill (hud.py) also appears for the whole voice note flow: a
+black capsule ringed by a drifting rainbow, slow while recording with an
+elapsed counter, fast while transcribing, then a brief "Copied to
+clipboard". Voice note status never uses notification banners; those are
+kept for clipboard sync only.
+
+Every recording is written to ~/.clipbridge/pending as a WAV before it is
+uploaded, and deleted once it transcribes. Anything left there is a note
+whose upload failed, so a note recorded offline survives. A background
+sweep retries them on its own and deletes each one the moment it works.
 
 Menu:
     Send to PC       push the current clipboard to the PC, instantly
     Fetch Now        one shot fetch of the latest incoming clip
     Record Note      toggle recording (same as the hotkey)
+    Retry Pending    upload saved notes now instead of waiting
     Auto: ON         toggle background polling
     Quit
 
@@ -55,6 +66,7 @@ except Exception:
 try:
     import numpy as np
     import sounddevice as sd
+    import soundfile as sf
     HAS_AUDIO = True
 except Exception:
     HAS_AUDIO = False
@@ -74,6 +86,11 @@ try:
     import noteproc
 except Exception:
     noteproc = None
+
+try:
+    from hud import RecordingHUD
+except Exception:
+    RecordingHUD = None
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -106,8 +123,21 @@ SUPA_ANON    = _cfg['supabase_anon_key']
 SUPA_HEADERS = {'apikey': SUPA_ANON, 'Authorization': f'Bearer {SUPA_ANON}'}
 POLL_SEC     = int(_cfg.get('poll_seconds', 3))
 WORKER_URL   = _cfg.get('transcribe_worker_url', '')
-HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+r')
+HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
 SAMPLERATE   = 16000
+
+# Recordings waiting on a transcription that has not succeeded yet. Bounded
+# so a worker that stays down cannot quietly fill the disk.
+PENDING_DIR       = Path.home() / '.clipbridge' / 'pending'
+PENDING_MAX_FILES = 40
+PENDING_MAX_DAYS  = 7
+RETRY_SEC         = 60
+RETRY_FIRST_SEC   = 15
+# How long to wait for the microphone to come up before telling the user it
+# is not answering. A cold open runs under a second, and a wedged one never
+# returns at all, so this is set well clear of the slow end: waiting longer
+# costs nothing in the case it exists to catch.
+OPEN_TIMEOUT_SEC  = 8.0
 
 CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
 
@@ -233,6 +263,14 @@ def _notify(message, title='Clip from PC'):
         f'display notification "{preview}" with title "{title}"'])
 
 
+def _on_main(fn, *args):
+    """Run fn on the main thread, or here and now if AppKit is not around."""
+    try:
+        AppHelper.callAfter(fn, *args)
+    except Exception:
+        fn(*args)
+
+
 def _parse_hotkey(spec):
     """'<ctrl>+<alt>+r' -> (virtualKey, modifierMask), or None if the spec
     is not understood. Letters, digits, and space are supported."""
@@ -254,6 +292,119 @@ def _parse_hotkey(spec):
     if key is None or not chosen:
         return None
     return key, _hk_mask(*chosen)
+
+
+# ── Audio input ────────────────────────────────────────────────────────────────
+
+def _reload_audio_devices():
+    """Rebuild PortAudio's device list. PortAudio reads the devices once at
+    import and never notices later changes, so after headphones, AirPods, or
+    an iPhone microphone come or go, every stream we open names a device from
+    whenever the app launched."""
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception:
+        return False
+
+
+def _open_input_stream(callback):
+    """Open the recording stream, reloading the device list and retrying once
+    if the first attempt fails. Returns the started stream, or raises the
+    error from the retry."""
+    try:
+        stream = sd.InputStream(samplerate=SAMPLERATE, channels=1,
+                                dtype='float32', callback=callback)
+        stream.start()
+        return stream
+    except Exception:
+        if not _reload_audio_devices():
+            raise
+    stream = sd.InputStream(samplerate=SAMPLERATE, channels=1,
+                            dtype='float32', callback=callback)
+    stream.start()
+    return stream
+
+
+def _close_stream_async(stream):
+    """Tear an input stream down on a thread of its own.
+
+    CoreAudio can block for a long time here, and never return at all when
+    the device disappeared while we held the stream open, for instance when
+    headphones are unplugged mid recording. Doing this on the main thread
+    freezes the menu bar, the hotkey, and the on screen pill, so it always
+    goes to a worker whose only job is to die quietly if it wedges.
+
+    abort() rather than stop(): stop() waits for buffers to drain, and by
+    this point the frames are already ours, so there is nothing to wait for.
+    """
+    if stream is None:
+        return
+
+    def run():
+        try:
+            stream.abort()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ── Pending notes ──────────────────────────────────────────────────────────────
+# A recording lives only in memory until it transcribes, so a failed upload
+# used to lose it outright. Every note is now written here first and removed
+# once its text comes back.
+
+def _save_pending(audio):
+    """Write the recording to disk before uploading. Returns the path, or
+    None if it could not be written, which must never block the upload."""
+    try:
+        PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        path = PENDING_DIR / f'note-{stamp}-{int(time.time() * 1000) % 1000:03d}.wav'
+        sf.write(str(path), audio, SAMPLERATE, format='WAV', subtype='PCM_16')
+        return path
+    except Exception:
+        return None
+
+
+def _discard_pending(path):
+    """Drop a note we no longer need. Called once its text has come back."""
+    try:
+        if path:
+            Path(path).unlink()
+    except Exception:
+        pass
+
+
+def _list_pending():
+    try:
+        return sorted(PENDING_DIR.glob('*.wav'), key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return []
+
+
+def _prune_pending():
+    """Bound the folder by age first, then by count, oldest going first."""
+    files = _list_pending()
+    cutoff = time.time() - PENDING_MAX_DAYS * 86400
+    kept = []
+    for p in files:
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                continue
+        except Exception:
+            continue
+        kept.append(p)
+    excess = len(kept) - PENDING_MAX_FILES
+    for p in kept[:excess] if excess > 0 else []:
+        _discard_pending(p)
 
 
 # ── Click routing ──────────────────────────────────────────────────────────────
@@ -289,7 +440,9 @@ class ClipBridge(rumps.App):
         if CAN_RECORD:
             self._record_item = rumps.MenuItem('Record Note',
                                                callback=self._toggle_record)
-            items += [None, self._record_item]
+            items += [None, self._record_item,
+                      rumps.MenuItem('Retry Pending',
+                                     callback=self._retry_now)]
         items += [
             None,
             self._auto_item,
@@ -303,7 +456,25 @@ class ClipBridge(rumps.App):
         self._rec_on     = False
         self._rec_frames = []
         self._rec_stream = None
+        # An open that has been asked for but has not come back yet, and a
+        # counter that invalidates it. Every toggle bumps the counter, so a
+        # stream that finally opens after we gave up on it is thrown away
+        # instead of turning into a phantom recording.
+        self._rec_opening = False
+        self._rec_gen     = 0
+        self._hud = None
+        # notes the live upload is holding, so the retry sweep leaves them be
+        self._inflight      = set()
+        self._inflight_lock = threading.Lock()
+        self._sweep_lock    = threading.Lock()
+        if HAS_APPKIT and RecordingHUD is not None:
+            try:
+                self._hud = RecordingHUD()
+            except Exception:
+                self._hud = None
         threading.Thread(target=self._poll, daemon=True).start()
+        if CAN_RECORD:
+            threading.Thread(target=self._retry_loop, daemon=True).start()
         self._hotkey_handle = None
         diag = {
             'started': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -440,10 +611,7 @@ class ClipBridge(rumps.App):
         except Exception:
             pass
         # recording touches UI, so make sure we are on the main thread
-        try:
-            AppHelper.callAfter(self._toggle_record, None)
-        except Exception:
-            self._toggle_record(None)
+        _on_main(self._toggle_record, None)
 
     def _set_state(self, state):
         """Swap the menu bar icon: red dot while recording, ellipsis while
@@ -467,61 +635,213 @@ class ClipBridge(rumps.App):
         except Exception:
             apply()
 
+    def _hud_flash(self, text, seconds=1.8):
+        """Short on screen confirmation, falling back to a notification
+        only when the HUD could not be built at all."""
+        if self._hud:
+            self._hud.flash(text, seconds)
+        else:
+            _notify(text, title='ClipBridge')
+
     def _toggle_record(self, _sender):
         if not CAN_RECORD:
             return
-        if not self._rec_on:
-            try:
-                self._rec_frames = []
-                self._rec_stream = sd.InputStream(
-                    samplerate=SAMPLERATE, channels=1, dtype='float32',
-                    callback=self._rec_callback)
-                self._rec_stream.start()
-            except Exception as e:
-                _notify(f'Could not open the microphone: {e}',
-                        title='ClipBridge')
-                self._rec_stream = None
-                return
-            self._rec_on = True
-            self._record_item.title = 'Stop Recording'
-            self._set_state('rec')
+        if self._rec_opening:
+            # Pressed again while the microphone is still coming up. Treat it
+            # as "forget it": drop the open on the floor so the next press
+            # starts clean rather than queueing a second one behind it.
+            self._rec_gen += 1
+            self._rec_opening = False
+            self._rec_on      = False
+            self._rec_frames  = []
+            self._set_state('idle')
+            self._hud_flash('Canceled.')
+        elif not self._rec_on:
+            # Opening the stream must not happen here. Pa_OpenStream takes a
+            # CoreAudio HAL lock, and when that lock is held by a wedged
+            # audio process it never returns, which on the main thread kills
+            # the menu bar, the pill, and the global hotkey for good. The
+            # open goes to a worker for the same reason the close does.
+            self._rec_frames  = []
+            self._rec_stream  = None
+            self._rec_opening = True
+            self._rec_gen    += 1
+            gen = self._rec_gen
+            threading.Thread(target=self._open_worker, args=(gen,),
+                             daemon=True).start()
+            threading.Thread(target=self._open_watchdog, args=(gen,),
+                             daemon=True).start()
         else:
+            # Nothing here may touch the stream: closing it can block for a
+            # long time, or forever, when the device went away mid recording,
+            # and this runs on the main thread. Hand the whole teardown to a
+            # worker and let the menu bar stay responsive.
             self._rec_on = False
-            try:
-                if self._rec_stream:
-                    self._rec_stream.stop()
-                    self._rec_stream.close()
-            except Exception:
-                pass
+            stream = self._rec_stream
             self._rec_stream = None
             self._record_item.title = 'Record Note'
             frames = self._rec_frames
             self._rec_frames = []
             if not frames:
                 self._set_state('idle')
-                _notify('Nothing recorded.', title='ClipBridge')
+                self._hud_flash('Nothing recorded.')
+                _close_stream_async(stream)
                 return
             self._set_state('busy')
-            threading.Thread(target=self._transcribe, args=(frames,),
+            if self._hud:
+                self._hud.processing()
+            threading.Thread(target=self._finish_note, args=(frames, stream),
                              daemon=True).start()
+
+    def _open_worker(self, gen):
+        """Bring the input stream up off the main thread. May block forever
+        if CoreAudio is wedged; this thread is a daemon and expendable."""
+        try:
+            stream = _open_input_stream(self._rec_callback)
+        except Exception as e:
+            _on_main(self._open_failed, gen, str(e))
+            return
+        if gen != self._rec_gen:
+            # canceled or timed out while we were waiting on CoreAudio
+            _close_stream_async(stream)
+            return
+        # capture from this instant, rather than waiting for the main thread
+        # to get around to the UI, so no opening word is lost
+        self._rec_on = True
+        _on_main(self._open_ready, gen, stream)
+
+    def _open_watchdog(self, gen):
+        """Give up on an open that never comes back, so the app says so and
+        the next press can try again instead of pressing into silence."""
+        time.sleep(OPEN_TIMEOUT_SEC)
+        if self._rec_gen == gen and self._rec_opening:
+            _on_main(self._open_failed, gen, 'it did not respond')
+
+    def _open_ready(self, gen, stream):
+        if gen != self._rec_gen:
+            self._rec_on = False
+            _close_stream_async(stream)
+            return
+        self._rec_opening = False
+        self._rec_stream  = stream
+        self._rec_on      = True
+        self._record_item.title = 'Stop Recording'
+        self._set_state('rec')
+        if self._hud:
+            self._hud.recording()
+
+    def _open_failed(self, gen, message):
+        if gen != self._rec_gen:
+            return
+        # bump, so an open that succeeds after we have written it off gets
+        # thrown away by _open_worker rather than recording unannounced
+        self._rec_gen    += 1
+        self._rec_opening = False
+        self._rec_on      = False
+        self._rec_frames  = []
+        self._rec_stream  = None
+        self._record_item.title = 'Record Note'
+        self._set_state('idle')
+        self._hud_flash(f'Could not open the microphone: {message}',
+                        seconds=3.0)
 
     def _rec_callback(self, indata, frames, time_info, status):
         if self._rec_on:
             self._rec_frames.append(indata.copy())
 
-    def _transcribe(self, frames):
+    def _finish_note(self, frames, stream=None):
+        path = None
         try:
             audio = np.concatenate(frames, axis=0)
+            # on disk before anything else, so even a teardown that wedges
+            # or a crash on the way out cannot lose the note
+            path = _save_pending(audio)
+            if path:
+                with self._inflight_lock:
+                    self._inflight.add(str(path))
+            _close_stream_async(stream)
+            stream = None
             text = noteproc.transcribe_note(audio, SAMPLERATE, WORKER_URL)
+            # the worker answered, so there is nothing left to retry, even
+            # when it heard nothing at all
+            _discard_pending(path)
             if text:
                 _copy(text)
-                _notify(text, title='Note transcribed')
+                self._hud_flash('Copied to clipboard')
             else:
-                _notify('Nothing heard.', title='ClipBridge')
+                self._hud_flash('Nothing heard.')
         except Exception as e:
-            _notify(str(e), title='ClipBridge')
+            if path:
+                self._hud_flash(f'{e}. Saved, will retry.', seconds=3.0)
+            else:
+                self._hud_flash(str(e), seconds=3.0)
         finally:
+            _close_stream_async(stream)   # no op once already handed off
+            if path:
+                with self._inflight_lock:
+                    self._inflight.discard(str(path))
             self._set_state('idle')
+
+    def _sweep_pending(self):
+        """One pass over the saved notes, oldest first. Stops at the first
+        note that still fails, since that almost always means the worker or
+        the network is down and the rest would fail the same way.
+
+        Only one sweep runs at a time, and a note the live upload still has
+        in hand is skipped, so a note can never be transcribed twice or land
+        on the clipboard twice."""
+        if not self._sweep_lock.acquire(blocking=False):
+            return 0
+        try:
+            return self._sweep_once()
+        finally:
+            self._sweep_lock.release()
+
+    def _sweep_once(self):
+        _prune_pending()
+        recovered = 0
+        for path in _list_pending():
+            if self._rec_on:
+                break
+            with self._inflight_lock:
+                busy = str(path) in self._inflight
+            if busy:
+                continue
+            try:
+                audio, sr = sf.read(str(path), dtype='float32')
+            except Exception:
+                _discard_pending(path)   # unreadable, retrying cannot help
+                continue
+            try:
+                text = noteproc.transcribe_note(audio, sr, WORKER_URL)
+            except Exception:
+                break
+            _discard_pending(path)
+            if text:
+                recovered += 1
+                _copy(text)
+                _notify(text, title='Recovered voice note')
+        if recovered:
+            self._hud_flash(f'Recovered {recovered} saved note'
+                            f'{"s" if recovered > 1 else ""}')
+        return recovered
+
+    def _retry_loop(self):
+        """Retry saved notes on our own, so one recorded with the worker
+        down or the network off lands as soon as it comes back."""
+        first = True
+        while True:
+            time.sleep(RETRY_FIRST_SEC if first else RETRY_SEC)
+            first = False
+            if self._rec_on:
+                continue     # never compete with a recording in progress
+            try:
+                self._sweep_pending()
+            except Exception:
+                pass
+
+    def _retry_now(self, _):
+        threading.Thread(target=self._sweep_pending, daemon=True).start()
 
 
 if __name__ == '__main__':

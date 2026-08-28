@@ -11,7 +11,7 @@ OPTIONS = {
     'packages': ['rumps', 'requests', 'certifi', 'urllib3', 'idna',
                  'charset_normalizer', 'numpy', 'sounddevice', 'soundfile',
                  '_sounddevice_data', '_soundfile_data', 'quickmachotkey'],
-    'includes': ['noteproc'],
+    'includes': ['noteproc', 'hud'],
     'plist': {
         'LSUIElement': True,
         'CFBundleName': 'ClipBridge',

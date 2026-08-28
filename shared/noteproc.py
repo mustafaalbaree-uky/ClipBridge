@@ -8,11 +8,15 @@ split at the quietest moment near each target cut so a word is never
 sliced in half, and uploads retry with exponential backoff on transient
 failures. Unlike ClipKeyboard, chunks upload in parallel.
 
-The thresholds are scaled for desktop dictation: anything at or under
-three minutes goes up as a single request (no seams at all), longer
-audio is cut into roughly two minute pieces.
+The thresholds are scaled for desktop dictation and tuned for latency:
+anything at or under a minute goes up as a single request (no seams at
+all), longer audio is divided into equal pieces of about 45 seconds
+that upload and transcribe in parallel. Equal pieces matter because the
+slowest piece sets the total wait; each cut still snaps to the quietest
+nearby moment so a word is never sliced in half.
 """
 import io
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,15 +30,15 @@ TRIM_THRESHOLD   = 0.012   # about -38 dBFS
 TRIM_PAD_SEC     = 0.12    # keep this much around speech
 TRIM_MIN_GAIN    = 0.25    # skip trimming if it saves less than this
 
-# Chunking (ClipKeyboard AudioChunker, scaled for dictation lengths)
-SINGLE_LIMIT_SEC = 180     # at or below this, one upload
-TARGET_CHUNK_SEC = 120     # aim for pieces about this long
-SNAP_WINDOW_SEC  = 10      # snap cuts to the quietest 100 ms within this
+# Chunking (ClipKeyboard AudioChunker, tuned so the pieces are equal and
+# short enough that parallel uploads actually pay off)
+SINGLE_LIMIT_SEC = 60      # at or below this, one upload
+TARGET_CHUNK_SEC = 45      # divide into equal pieces of at most about this
+SNAP_WINDOW_SEC  = 5       # snap cuts to the quietest 100 ms within this
 QUIET_WIN_SEC    = 0.1
 MIN_CUT_GAP_SEC  = 15      # a snapped cut may not land before this gap
-MIN_TAIL_SEC     = 30      # do not leave a tiny final piece
 
-MAX_WORKERS      = 4
+MAX_WORKERS      = 8
 ATTEMPTS         = 3
 
 
@@ -95,19 +99,24 @@ def _quiet_point(audio, sr, target):
 
 def split_chunks(audio, sr):
     """Ordered list of arrays to upload. A single element means the
-    whole recording goes up as one request."""
+    whole recording goes up as one request.
+
+    Long audio is divided into pieces of equal length (the fewest that
+    keeps each at or under the target), because the pieces run in
+    parallel and the slowest one sets the total wait. Each nominal cut
+    then snaps to the quietest nearby moment."""
     total = len(audio) / sr
     if total <= SINGLE_LIMIT_SEC:
         return [audio]
 
+    n = math.ceil(total / TARGET_CHUNK_SEC)
     cuts = [0.0]
-    target = TARGET_CHUNK_SEC
-    while target < total - MIN_TAIL_SEC:
+    for i in range(1, n):
+        target = total * i / n
         snapped = _quiet_point(audio, sr, target)
         cut = max(snapped if snapped is not None else target,
                   cuts[-1] + MIN_CUT_GAP_SEC)
-        cuts.append(cut)
-        target = cuts[-1] + TARGET_CHUNK_SEC
+        cuts.append(min(cut, total))
     cuts.append(total)
 
     chunks = [audio[int(a * sr):int(b * sr)]

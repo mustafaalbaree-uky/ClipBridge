@@ -16,13 +16,18 @@ permission and works everywhere, including Terminal. While recording the
 menu bar icon becomes a red dot; while transcribing, an ellipsis. A small
 on screen pill (hud.py) also appears for the whole voice note flow: a
 black capsule ringed by a drifting rainbow, slow while recording with an
-elapsed counter, fast while transcribing, then a brief "Copied to
-clipboard". Voice note status never uses notification banners; those are
-kept for clipboard sync only.
+elapsed counter, fast while transcribing. When the transcript lands it
+opens into two lines: a quiet "copied to clipboard" over the first few
+words of what you said, with the spectrum moving out of the ring and into
+the words themselves. It rides just below the mouse pointer and follows
+it, staying clamped inside the screen the pointer is on. Voice note
+status never uses notification banners; those are kept for clipboard
+sync only.
 
 Recording is done by AVAudioRecorder, which writes straight into
-~/.clipbridge/pending, so the audio is on disk while it is still being
-spoken rather than only after the fact. The file is deleted once it
+~/.clipbridge/pending/partial, so the audio is on disk while it is still
+being spoken rather than only after the fact, and moves up into
+~/.clipbridge/pending the moment recording stops. The file is deleted once it
 transcribes; anything left there is a note whose upload failed, so a note
 recorded offline, or one interrupted by a crash, survives. A background
 sweep retries them on its own and deletes each one the moment it works.
@@ -96,6 +101,11 @@ try:
 except Exception:
     RecordingHUD = None
 
+try:
+    import loginitem
+except Exception:
+    loginitem = None
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -133,6 +143,12 @@ SAMPLERATE   = 16000
 # Recordings waiting on a transcription that has not succeeded yet. Bounded
 # so a worker that stays down cannot quietly fill the disk.
 PENDING_DIR       = Path.home() / '.clipbridge' / 'pending'
+# A recording in progress is written here instead, so the retry sweep, which
+# globs PENDING_DIR itself and not below it, cannot pick up a note that is
+# still being spoken. It has to keep a real .wav suffix: AVAudioRecorder picks
+# its container from the file extension, and an extension it does not know
+# gets it a CAF file, which then wore a .wav name once it was moved.
+PARTIAL_DIR       = PENDING_DIR / 'partial'
 PENDING_MAX_FILES = 40
 PENDING_MAX_DAYS  = 7
 RETRY_SEC         = 60
@@ -146,7 +162,10 @@ OPEN_TIMEOUT_SEC  = 8.0
 # recording rather than uploaded. It has to clear the block the recorder
 # preallocates, which an accidental double press leaves behind on its own.
 WAV_MIN_SEC       = 0.35
-WAV_MIN_BYTES     = 44 + int(SAMPLERATE * 2 * WAV_MIN_SEC)
+# AVAudioRecorder aligns the audio to a 4 KB boundary with a filler chunk, so
+# a recording of no length at all still weighs this much on disk.
+WAV_HEADER_BYTES  = 4096
+WAV_MIN_BYTES     = WAV_HEADER_BYTES + int(SAMPLERATE * 2 * WAV_MIN_SEC)
 
 CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
 
@@ -218,21 +237,33 @@ _REC_PATH  = _render_record_dot()
 # ── Supabase ───────────────────────────────────────────────────────────────────
 
 def _fetch():
-    """Latest clip addressed to this Mac. Returns (id, content)."""
+    """Latest clip addressed to this Mac. Returns (ok, id, content).
+
+    `ok` says the database answered. An empty table is an answer, so it
+    comes back as (True, None, None), while a failed request comes back as
+    (False, None, None). The poll loop has to tell those two apart: it
+    seeds itself from the table at launch, and a network blip read as an
+    empty table would seed on the next real clip instead of copying it.
+    """
     try:
         res = requests.get(
             f'{SUPA_URL}/rest/v1/clips',
             headers=SUPA_HEADERS,
-            params={'select': 'id,content', 'source': 'eq.pc-to-mac',
+            params={'select': 'id,content',
+                    # 'pc-to-mac' is the desktop app's directed label; the
+                    # QR-Bridge web page tags everything it pushes 'pc'.
+                    'or': '(source.eq.pc-to-mac,source.eq.pc)',
                     'order': 'created_at.desc', 'limit': '1'},
             timeout=10,
         )
-        if res.ok and res.json():
-            row = res.json()[0]
-            return row['id'], row['content']
+        if not res.ok:
+            return False, None, None
+        rows = res.json()
+        if rows:
+            return True, rows[0]['id'], rows[0]['content']
+        return True, None, None
     except Exception:
-        pass
-    return None, None
+        return False, None, None
 
 
 def _push(content):
@@ -329,12 +360,12 @@ def _recorder_settings():
 
 
 def _new_recording_path():
-    """Where the recording in progress is written. It carries a .rec suffix
-    so the retry sweep, which looks only at .wav, cannot pick up a note that
-    is still being spoken. It becomes a .wav the moment recording stops."""
-    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    """Where the recording in progress is written. It sits in PARTIAL_DIR,
+    out of the retry sweep's reach, and moves up into PENDING_DIR the moment
+    recording stops."""
+    PARTIAL_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime('%Y%m%d-%H%M%S')
-    return PENDING_DIR / f'note-{stamp}-{int(time.time() * 1000) % 1000:03d}.rec'
+    return PARTIAL_DIR / f'note-{stamp}-{int(time.time() * 1000) % 1000:03d}.wav'
 
 
 def _start_recorder(path):
@@ -363,7 +394,7 @@ def _finish_recorder(rec, path):
         if not path.exists() or path.stat().st_size < WAV_MIN_BYTES:
             _discard_pending(path)
             return None
-        final = path.with_suffix('.wav')
+        final = PENDING_DIR / path.name
         path.rename(final)
         return final
     except Exception:
@@ -371,19 +402,28 @@ def _finish_recorder(rec, path):
 
 
 def _recover_part_files():
-    """A .rec left behind means the app died mid recording. Promote it so
-    the retry sweep transcribes it instead of leaving it to rot."""
+    """A file left in PARTIAL_DIR means the app died mid recording. Promote it
+    so the retry sweep transcribes it instead of leaving it to rot. The .rec
+    files are what builds before this one left behind, in PENDING_DIR itself
+    and holding a CAF rather than a WAV, which soundfile reads either way."""
+    for part, final in ([(p, PENDING_DIR / p.name)
+                         for p in _glob(PARTIAL_DIR, '*.wav')] +
+                        [(p, p.with_suffix('.wav'))
+                         for p in _glob(PENDING_DIR, '*.rec')]):
+        try:
+            if part.stat().st_size >= WAV_MIN_BYTES:
+                part.rename(final)
+            else:
+                part.unlink()
+        except Exception:
+            pass
+
+
+def _glob(directory, pattern):
     try:
-        for part in PENDING_DIR.glob('*.rec'):
-            try:
-                if part.stat().st_size >= WAV_MIN_BYTES:
-                    part.rename(part.with_suffix('.wav'))
-                else:
-                    part.unlink()
-            except Exception:
-                pass
+        return list(directory.glob(pattern))
     except Exception:
-        pass
+        return []
 
 
 # ── Pending notes ──────────────────────────────────────────────────────────────
@@ -451,6 +491,8 @@ class ClipBridge(rumps.App):
         super().__init__('ClipBridge', icon=_ICON_PATH, template=True,
                          quit_button=None)
         self._auto_item = rumps.MenuItem('Auto: ON', callback=self._toggle_auto)
+        self._login_item = rumps.MenuItem('Open at Login',
+                                          callback=self._toggle_login)
         items = [
             rumps.MenuItem('Send to PC', callback=self._send_to_pc),
             rumps.MenuItem('Fetch Now',  callback=self._fetch_now),
@@ -464,6 +506,7 @@ class ClipBridge(rumps.App):
         items += [
             None,
             self._auto_item,
+            self._login_item,
             None,
             rumps.MenuItem('Quit', callback=lambda _: rumps.quit_application()),
         ]
@@ -485,20 +528,30 @@ class ClipBridge(rumps.App):
         self._inflight      = set()
         self._inflight_lock = threading.Lock()
         self._sweep_lock    = threading.Lock()
+        hud_note = 'off, no AppKit' if not HAS_APPKIT else \
+                   'off, hud.py did not import' if RecordingHUD is None else 'on'
         if HAS_APPKIT and RecordingHUD is not None:
             try:
                 self._hud = RecordingHUD()
-            except Exception:
+            except Exception as e:
                 self._hud = None
+                hud_note = f'off, {e}'
         threading.Thread(target=self._poll, daemon=True).start()
         if CAN_RECORD:
             _recover_part_files()
             threading.Thread(target=self._retry_loop, daemon=True).start()
         self._hotkey_handle = None
+        # Asked for once per launch. An install deletes /Applications/
+        # ClipBridge.app and copies a new one over it, which takes the login
+        # registration with it, so the intent has to be restated by the app
+        # that the new bundle starts.
+        login_state = loginitem.reconcile() if loginitem else 'loginitem.py did not import'
+        self._sync_login_item()
         diag = {
             'started': time.strftime('%Y-%m-%d %H:%M:%S'),
             'can_record': CAN_RECORD, 'has_audio': HAS_AUDIO,
             'has_hotkey_lib': HAS_HOTKEY, 'hotkey': HOTKEY,
+            'hud': hud_note, 'login_item': login_state,
         }
         if CAN_RECORD and HAS_HOTKEY and HOTKEY:
             try:
@@ -577,16 +630,29 @@ class ClipBridge(rumps.App):
                 pass
 
     def _poll(self):
+        # Seed first, then poll. Whatever is already in the table at launch
+        # is history and must not land on the clipboard, but an empty table
+        # is just as good a starting point as a full one, so the seed is
+        # taken as soon as the database answers at all.
+        #
+        # Seeding from inside the loop instead, on the first row it happened
+        # to see, meant an empty table left the client unseeded, and then the
+        # next clip to arrive was taken as the seed and silently dropped.
+        # Rows are held for fifteen minutes, so an empty table is the normal
+        # state and that dropped clip was very nearly every clip.
+        while not self._seeded:
+            ok, row_id, _ = _fetch()
+            if ok:
+                self._last_id = row_id
+                self._seeded  = True
+                break
+            time.sleep(POLL_SEC)
+
         while True:
             try:
                 if self._auto:
-                    row_id, content = _fetch()
-                    if row_id is not None and not self._seeded:
-                        # remember where the table is at launch without
-                        # copying, so an old clip never stomps the clipboard
-                        self._seeded  = True
-                        self._last_id = row_id
-                    elif content and row_id != self._last_id:
+                    ok, row_id, content = _fetch()
+                    if ok and content and row_id != self._last_id:
                         self._last_id = row_id
                         _copy(content)
                         _notify(content)
@@ -598,16 +664,55 @@ class ClipBridge(rumps.App):
         self._auto = not self._auto
         item.title = f'Auto: {"ON" if self._auto else "OFF"}'
 
+    # ── Open at login ──────────────────────────────────────────────────────
+
+    def _toggle_login(self, _):
+        """Flip the login item, or, when it has been switched off in System
+        Settings, open the pane that owns that switch. Registering again would
+        not lift it, so sending you to the one control that will is the only
+        thing this can honestly do."""
+        if loginitem is None:
+            return
+        if loginitem.state() == loginitem.BLOCKED:
+            subprocess.run(['open', 'x-apple.systempreferences:'
+                            'com.apple.LoginItems-Settings.extension'])
+            return
+        loginitem.set_enabled(loginitem.state() != loginitem.ON)
+        self._sync_login_item()
+
+    def _sync_login_item(self):
+        """Show what macOS is doing, never what was last asked for. The two
+        come apart on every install, since the registration lives and dies with
+        the bundle that build.sh replaces.
+
+        The checkmark has a third setting, and BLOCKED is what it is for: the
+        item is registered and will not start, which is neither of the other
+        two and should not be drawn as either."""
+        if loginitem is None:
+            self._login_item.set_callback(None)
+            return
+        state = loginitem.state()
+        if state == loginitem.UNAVAILABLE:
+            self._login_item.state = 0
+            self._login_item.set_callback(None)
+        elif state == loginitem.BLOCKED:
+            self._login_item.state = -1
+        else:
+            self._login_item.state = 1 if state == loginitem.ON else 0
+
     def _fetch_now(self, _):
         def _run():
-            row_id, content = _fetch()
+            ok, row_id, content = _fetch()
             if content:
                 self._last_id = row_id
                 self._seeded  = True
                 _copy(content)
                 _notify(content)
-            else:
+            elif ok:
+                self._seeded = True
                 _notify('Nothing waiting.', title='ClipBridge')
+            else:
+                _notify('Could not reach the database.', title='ClipBridge')
         threading.Thread(target=_run, daemon=True).start()
 
     def _send_to_pc(self, _):
@@ -661,6 +766,15 @@ class ClipBridge(rumps.App):
             self._hud.flash(text, seconds)
         else:
             _notify(text, title='ClipBridge')
+
+    def _hud_copied(self, text):
+        """The transcript is on the clipboard. Showing its opening words
+        is what makes the confirmation worth reading: it says the note
+        was heard, not merely that something finished."""
+        if self._hud:
+            self._hud.copied(text)
+        else:
+            _notify(text, title='Copied to clipboard')
 
     def _toggle_record(self, _sender):
         if not CAN_RECORD:
@@ -770,7 +884,7 @@ class ClipBridge(rumps.App):
             _discard_pending(final)
             if text:
                 _copy(text)
-                self._hud_flash('Copied to clipboard')
+                self._hud_copied(text)
             else:
                 self._hud_flash('Nothing heard.')
         except Exception as e:

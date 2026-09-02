@@ -23,7 +23,7 @@ Every clipboard sync product wants an account, a subscription, or your data on s
 
 ## How it works
 
-One table, three clients, and a `source` field that says who a clip is for. Clips expire from a rolling buffer of 50 rows, so the table never grows.
+One table, three clients, and a `source` field that says who a clip is for. A clip is readable for fifteen minutes and then it is not, and a rolling buffer of 50 rows keeps the table from growing.
 
 ```mermaid
 sequenceDiagram
@@ -43,7 +43,7 @@ sequenceDiagram
     Note over Phone: copied to clipboard
 ```
 
-Both desktop clients poll with a seeded cursor, so launching an app never replays an old clip onto your clipboard, and the Windows poll loop is hardened against the clipboard being momentarily locked by another app.
+Both desktop clients fix a cursor from the table before they start polling, so launching an app never replays an old clip onto your clipboard. An empty table is a valid starting point, which matters because clips expire after fifteen minutes and empty is the usual state. The Windows poll loop is also hardened against the clipboard being momentarily locked by another app.
 
 ## Setup
 
@@ -68,7 +68,11 @@ cd mac
 ./build.sh --install
 ```
 
-That builds `ClipBridge.app`, installs it to /Applications, and launches it. Add it to your Login Items if you want it always on. To iterate without building, `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python3 clipbridge.py`.
+That builds `ClipBridge.app`, installs it to /Applications, and launches it. To iterate without building, `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python3 clipbridge.py`.
+
+It starts at login, and "Open at Login" in the menu turns that off. The checkmark reports `SMAppService` rather than the preference behind it, because the two come apart on every install: the registration is bound to the bundle, and `build.sh --install` deletes and replaces the bundle. What is stored, in `~/.clipbridge/prefs.json`, is the intent, and the app restates it at launch, which is what puts the registration back. A dash instead of a checkmark means the item was switched off in System Settings > General > Login Items; clicking it then opens that pane, because registering again would not lift it. Running from source, the item is greyed: `mainAppService` would otherwise register the Python framework's own `Python.app`, so [`mac/loginitem.py`](mac/loginitem.py) checks the bundle identifier before touching anything.
+
+`login_item` in `~/.clipbridge/mac_debug.log` says which of those four it was at the last launch. That is the cheap way to check it: the system's own record is in `sfltool dumpbtm`, which needs root and asks for a password every time.
 
 ### 3. Windows
 
@@ -109,7 +113,7 @@ Mac permissions: the first recording asks for microphone access, and that is the
 
 ## Privacy
 
-Your clips live in your own Supabase project and nowhere else. The rolling buffer keeps only the 50 most recent, each row carries a 24 hour expiry, and nothing is sent anywhere until you press send.
+Your clips live in your own Supabase project and nowhere else. A clip stops being readable fifteen minutes after it is written, the rolling buffer keeps only the 50 most recent, and nothing is sent anywhere until you press send.
 
 ## License
 

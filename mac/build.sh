@@ -38,6 +38,10 @@ if [ "${1:-}" = "--install" ]; then
     fi
     rm -rf "/Applications/ClipBridge.app"
     cp -R "dist/ClipBridge.app" /Applications/
-    open -a ClipBridge
+    # by full path, never by name. LaunchServices has both this build
+    # directory and /Applications registered under the same name, and it
+    # picked dist last time, so a stale dist could be launched while the
+    # installed copy sat there unused and the two looked identical
+    open "/Applications/ClipBridge.app"
     echo "Installed to /Applications and launched."
 fi

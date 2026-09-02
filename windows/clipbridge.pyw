@@ -214,23 +214,32 @@ def _notify(text, source='recorded'):
 # ── Supabase ───────────────────────────────────────────────────────────────────
 
 def _fetch_supabase():
-    """Latest clip addressed to this PC. Returns (id, content, source)."""
+    """Latest clip addressed to this PC. Returns (ok, id, content, source).
+
+    `ok` says the database answered. An empty table is an answer, so it
+    comes back as (True, None, None, None), while a failed request comes
+    back as (False, None, None, None). The poll loop has to tell those two
+    apart: it seeds itself from the table at launch, and a network blip
+    read as an empty table would seed on the next real clip instead of
+    copying it.
+    """
     try:
         res = requests.get(
             f'{SUPA_URL}/rest/v1/clips',
             headers=SUPA_HEADERS,
             params={'select': 'id,content,source',
-                    'or': '(source.is.null,source.eq.mac-to-pc,source.eq.ios)',
+                    'or': '(source.is.null,source.eq.mac-to-pc,source.eq.ios,source.eq.pc)',
                     'order': 'created_at.desc', 'limit': '1'},
             timeout=10,
         )
-        if res.ok:
-            data = res.json()
-            if data:
-                return data[0]['id'], data[0]['content'], data[0].get('source')
+        if not res.ok:
+            return False, None, None, None
+        data = res.json()
+        if data:
+            return True, data[0]['id'], data[0]['content'], data[0].get('source')
+        return True, None, None, None
     except Exception:
-        pass
-    return None, None, None
+        return False, None, None, None
 
 
 def _push_supabase(content, source='pc'):
@@ -273,14 +282,17 @@ def _send_clipboard(dest, notify_source):
 def _fetch_now(icon=None, item=None):
     def _run():
         global _last_seen_id, _seeded
-        row_id, content, src = _fetch_supabase()
+        ok, row_id, content, src = _fetch_supabase()
         if content:
             _last_seen_id = row_id
             _seeded = True
             _copy_to_clipboard(content)
             _notify(content, source='fetched-mac' if src == 'mac-to-pc' else 'fetched')
-        else:
+        elif ok:
+            _seeded = True
             _notify('', source='nothing')
+        else:
+            _notify('Could not reach the database.', source='error')
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -288,17 +300,33 @@ def _fetch_now(icon=None, item=None):
 
 def _poll_loop():
     global _last_seen_id, _seeded
+    # Seed first, then poll. Whatever is already in the table at launch is
+    # history and must not land on the clipboard, but an empty table is just
+    # as good a starting point as a full one, so the seed is taken as soon
+    # as the database answers at all.
+    #
+    # Seeding from inside the loop instead, on the first row it happened to
+    # see, meant an empty table left the client unseeded, and then the next
+    # clip to arrive was taken as the seed and silently dropped. Rows are
+    # held for fifteen minutes, so an empty table is the normal state and
+    # that dropped clip was very nearly every clip.
+    while not _seeded and not _poll_stop.is_set():
+        ok, row_id, _content, _src = _fetch_supabase()
+        if ok:
+            _last_seen_id = row_id
+            _seeded = True
+            break
+        _poll_stop.wait(POLL_SEC)
+
     while not _poll_stop.is_set():
         try:
-            row_id, content, src = _fetch_supabase()
-            if row_id is not None and not _seeded:
-                # first sight of the table: remember where we are without
-                # copying, so an old clip never stomps the clipboard at launch
-                _seeded = True
-                _last_seen_id = row_id
-            elif content and row_id != _last_seen_id:
-                _last_seen_id = row_id
+            ok, row_id, content, src = _fetch_supabase()
+            if ok and content and row_id != _last_seen_id:
+                # only move the cursor once the text is really on the
+                # clipboard, so a clip lost to a locked clipboard is tried
+                # again on the next pass instead of being skipped
                 if _copy_to_clipboard(content):
+                    _last_seen_id = row_id
                     _notify(content,
                             source='fetched-mac' if src == 'mac-to-pc' else 'fetched')
         except Exception:

@@ -26,9 +26,22 @@ import soundfile as sf
 
 # Silence trimming (ClipKeyboard SilenceTrimmer constants)
 TRIM_WINDOW_SEC  = 0.02    # loudness measured per 20 ms window
-TRIM_THRESHOLD   = 0.012   # about -38 dBFS
+TRIM_THRESHOLD   = 0.012   # about -38 dBFS, the loudest the cut may sit
 TRIM_PAD_SEC     = 0.12    # keep this much around speech
 TRIM_MIN_GAIN    = 0.25    # skip trimming if it saves less than this
+# ClipKeyboard could use a fixed threshold because an iPhone applies its own
+# input gain, so dictation always arrives at roughly the same level. A desktop
+# microphone does not: the system input slider, the distance to the laptop and
+# a headset's own gain all move it, and at a low setting ordinary speech peaks
+# under -38 dBFS in its entirety. A fixed cut then reads the whole note as
+# silence and deletes it. So the cut is placed relative to the note's own
+# speech level as well, and never above the fixed value.
+TRIM_REL         = 0.3     # cut this far below the note's own speech level
+# Trimming exists to shrink an upload, not to decide what was said. When it
+# wants to throw away more than this, its idea of the level is far likelier to
+# be wrong than the recording is to be that empty, and the cost of being wrong
+# is silent: a scrap of noise makes Whisper invent a sentence rather than fail.
+TRIM_MAX_DROP    = 0.8
 
 # Chunking (ClipKeyboard AudioChunker, tuned so the pieces are equal and
 # short enough that parallel uploads actually pay off)
@@ -60,7 +73,14 @@ def trim_silence(audio, sr):
     win = max(1, int(sr * TRIM_WINDOW_SEC))
     pad = int(sr * TRIM_PAD_SEC)
 
-    loud = _window_rms(audio, win) >= TRIM_THRESHOLD
+    rms = _window_rms(audio, win)
+    # The 95th percentile stands in for how loud this note's speech is: high
+    # enough to sit inside speech rather than on a stray peak, low enough that
+    # a note which is mostly pause still reports the speaking level.
+    level = float(np.percentile(rms, 95))
+    threshold = min(TRIM_THRESHOLD, level * TRIM_REL)
+
+    loud = rms >= threshold
     idx = np.flatnonzero(loud)
     if idx.size == 0:
         return audio
@@ -81,7 +101,9 @@ def trim_silence(audio, sr):
 
     kept = sum(hi - lo for lo, hi in ranges)
     if kept >= n - int(sr * TRIM_MIN_GAIN):
-        return audio
+        return audio      # saves too little to be worth the work
+    if kept < n * (1.0 - TRIM_MAX_DROP):
+        return audio      # wants to cut too much to be believed
     return np.concatenate([audio[lo:hi] for lo, hi in ranges])
 
 

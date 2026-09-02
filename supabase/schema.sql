@@ -14,6 +14,15 @@ create table if not exists clips (
 -- it can read the clips you share while they are still live.
 alter table clips enable row level security;
 
+-- Policies decide which rows a caller may touch. They do not decide which
+-- statements a caller may run, and the two are separate: a grant of TRUNCATE
+-- is not filtered by any policy, so a single statement would empty the table
+-- no matter what the policies say. Supabase hands new tables a broad default
+-- grant, so name the three statements the policies below actually govern and
+-- take back everything else.
+revoke all on clips from anon;
+grant select, insert, delete on clips to anon;
+
 -- Reads are limited to clips that have not expired yet. A clip that ages
 -- out is unreadable even though the row is still there, which is what keeps
 -- the exposure window short.
@@ -55,7 +64,9 @@ create trigger clips_clamp_expiry
     before insert on clips
     for each row execute function clamp_clip_expiry();
 
--- Rolling buffer: keep only the 50 most recent clips.
+-- Rolling buffer, and the drain. Every insert first drops whatever has
+-- expired, so the table empties itself without a scheduler to run and watch,
+-- then caps what is left at the 50 most recent.
 -- Optional iPhone push: if you use the Bark app, uncomment the block below
 -- and paste in your own Bark device key. Requires the pg_net extension
 -- (Database -> Extensions -> pg_net).
@@ -65,6 +76,15 @@ language plpgsql
 security definer
 as $$
 begin
+    -- security definer above is load bearing, and it went missing from the
+    -- live database once. Without it this runs as the caller, which is anon,
+    -- and both statements below come back under row level security: the
+    -- subquery can only see clips that are still live, and the delete can
+    -- only touch ones that have expired. The buffer then stops capping
+    -- anything and the table grows without limit. It reached 145 rows that
+    -- way. Owned by postgres and running as postgres, it sees the whole table.
+    delete from clips where expires_at < now();
+
     delete from clips
     where id not in (
         select id from clips order by created_at desc limit 50

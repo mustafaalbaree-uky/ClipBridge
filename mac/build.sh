@@ -4,9 +4,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -d .venv ]; then
-    python3 -m venv .venv
+    PY=$(command -v python3.13 || command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3)
+    "$PY" -m venv .venv
     .venv/bin/pip install --quiet --upgrade pip
-    .venv/bin/pip install --quiet rumps requests py2app
+    .venv/bin/pip install --quiet -r requirements.txt
 fi
 
 # Bundle icon from the shared asset, if iconutil is available

@@ -2,11 +2,18 @@
 Voice note processing shared by the Windows and Mac clients.
 
 The paradigm is ported from ClipKeyboard (the author's iPhone app):
-silence is truncated before upload (20 ms RMS windows, about -38 dBFS
-threshold, 120 ms of padding kept around speech), long recordings are
-split at the quietest moment near each target cut so a word is never
-sliced in half, and uploads retry with exponential backoff on transient
-failures. Unlike ClipKeyboard, chunks upload in parallel.
+long recordings are split at the quietest moment near each target cut
+so a word is never sliced in half, and uploads retry with exponential
+backoff on transient failures. Unlike ClipKeyboard, chunks upload in
+parallel.
+
+There is no silence trim. A fixed loudness cut throws away real speech
+along with the quiet, not just dead air: a sentence's soft trailing
+words, or a speaker sitting farther from the microphone in a meeting
+room, both read as silence and disappear from the transcript. Chunking
+already caps each upload at about 45 seconds, so trimming would only
+be shrinking uploads that are already small, and that is not worth the
+missing words.
 
 The thresholds are scaled for desktop dictation and tuned for latency:
 anything at or under a minute goes up as a single request (no seams at
@@ -23,25 +30,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 import soundfile as sf
-
-# Silence trimming (ClipKeyboard SilenceTrimmer constants)
-TRIM_WINDOW_SEC  = 0.02    # loudness measured per 20 ms window
-TRIM_THRESHOLD   = 0.012   # about -38 dBFS, the loudest the cut may sit
-TRIM_PAD_SEC     = 0.12    # keep this much around speech
-TRIM_MIN_GAIN    = 0.25    # skip trimming if it saves less than this
-# ClipKeyboard could use a fixed threshold because an iPhone applies its own
-# input gain, so dictation always arrives at roughly the same level. A desktop
-# microphone does not: the system input slider, the distance to the laptop and
-# a headset's own gain all move it, and at a low setting ordinary speech peaks
-# under -38 dBFS in its entirety. A fixed cut then reads the whole note as
-# silence and deletes it. So the cut is placed relative to the note's own
-# speech level as well, and never above the fixed value.
-TRIM_REL         = 0.3     # cut this far below the note's own speech level
-# Trimming exists to shrink an upload, not to decide what was said. When it
-# wants to throw away more than this, its idea of the level is far likelier to
-# be wrong than the recording is to be that empty, and the cost of being wrong
-# is silent: a scrap of noise makes Whisper invent a sentence rather than fail.
-TRIM_MAX_DROP    = 0.8
 
 # Chunking (ClipKeyboard AudioChunker, tuned so the pieces are equal and
 # short enough that parallel uploads actually pay off)
@@ -63,48 +51,6 @@ def _window_rms(audio, win):
     padded[:n] = audio
     frames = padded.reshape(count, win)
     return np.sqrt(np.mean(frames * frames, axis=1))
-
-
-def trim_silence(audio, sr):
-    """Drop near silent stretches, keeping padding around speech.
-    Returns the original array when there is no speech at all or when
-    trimming would not meaningfully shrink the audio."""
-    n = len(audio)
-    win = max(1, int(sr * TRIM_WINDOW_SEC))
-    pad = int(sr * TRIM_PAD_SEC)
-
-    rms = _window_rms(audio, win)
-    # The 95th percentile stands in for how loud this note's speech is: high
-    # enough to sit inside speech rather than on a stray peak, low enough that
-    # a note which is mostly pause still reports the speaking level.
-    level = float(np.percentile(rms, 95))
-    threshold = min(TRIM_THRESHOLD, level * TRIM_REL)
-
-    loud = rms >= threshold
-    idx = np.flatnonzero(loud)
-    if idx.size == 0:
-        return audio
-
-    # consecutive loud windows -> runs -> padded sample ranges -> merge
-    breaks = np.flatnonzero(np.diff(idx) > 1)
-    starts = np.concatenate(([idx[0]], idx[breaks + 1]))
-    ends   = np.concatenate((idx[breaks], [idx[-1]]))
-
-    ranges = []
-    for s, e in zip(starts, ends):
-        lo = max(0, s * win - pad)
-        hi = min(n, (e + 1) * win + pad)
-        if ranges and lo <= ranges[-1][1]:
-            ranges[-1][1] = max(ranges[-1][1], hi)
-        else:
-            ranges.append([lo, hi])
-
-    kept = sum(hi - lo for lo, hi in ranges)
-    if kept >= n - int(sr * TRIM_MIN_GAIN):
-        return audio      # saves too little to be worth the work
-    if kept < n * (1.0 - TRIM_MAX_DROP):
-        return audio      # wants to cut too much to be believed
-    return np.concatenate([audio[lo:hi] for lo, hi in ranges])
 
 
 def _quiet_point(audio, sr, target):
@@ -180,13 +126,12 @@ def _post(wav, worker_url, model, language):
 
 def transcribe_note(audio, sr, worker_url,
                     model='whisper-large-v3-turbo', language='en'):
-    """Silence trim, chunk if long, upload (in parallel when chunked),
-    and return the stitched transcript. Raises RuntimeError on failure."""
+    """Chunk if long, upload (in parallel when chunked), and return the
+    stitched transcript. Raises RuntimeError on failure."""
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
         return ''
 
-    audio = trim_silence(audio, sr)
     chunks = split_chunks(audio, sr)
     wavs = [_wav_bytes(c, sr) for c in chunks]
 

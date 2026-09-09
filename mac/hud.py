@@ -1,19 +1,26 @@
 """
 On screen state pill for ClipBridge voice notes.
 
-A small black pill wrapped in a shifting rainbow ring. It drifts along
-slowly while recording (with a live elapsed counter), speeds up while
-transcribing, and flashes short confirmations. It replaces the
+A small frosted slate pill ringed in a band of drifting water colour. It
+drifts slowly while recording (with a live elapsed counter), speeds up
+while transcribing, and flashes short confirmations. It replaces the
 notification banners for the whole voice note flow.
+
+The colours come from the desktop it sits on rather than from nowhere:
+the ground is a real backdrop blur under a slate wash, the same thing
+every widget on that screen is, and the ring runs from deep water through
+the shallows to the pale blue of the menu bar and back. The ring keeps
+moving because its speed is how the pill says whether it is listening or
+working. See the palette block below for what each value is taken from.
 
 When a note lands on the clipboard the pill opens into two lines: a
 quiet "copied to clipboard" caption over the first few words of what
-you actually said. Those words are the hero, so they are the thing
-carrying the spectrum: the rainbow moves out of the ring, which drops to
-a faint halo, and into the glyphs themselves, which rise and bloom into
-place and hold a slow drift of colour while you read them. One rainbow,
-on the one element that matters, which is the point of showing the words
-at all: proof it heard you, not just proof it finished.
+you actually said. Those words are the hero, so they get the treatment:
+they rise and bloom into place, a halo comes up under them from the glyph
+shapes themselves, and a slow sheen crosses them while you read. They
+stay white, because every figure that matters on this desktop is white.
+That is the point of showing the words at all: proof it heard you, not
+just proof it finished.
 
 The panel never takes focus and ignores every click, so it can sit over
 anything without getting in the way. A pill that is waiting to time out
@@ -54,7 +61,11 @@ import time
 import traceback
 from pathlib import Path
 
-from AppKit import (NSColor, NSEvent, NSFont, NSPanel, NSScreen, NSWorkspace,
+from AppKit import (NSAppearance, NSColor, NSEvent, NSFont, NSPanel, NSScreen,
+                    NSWorkspace, NSVisualEffectView,
+                    NSVisualEffectBlendingModeBehindWindow,
+                    NSVisualEffectMaterialHUDWindow,
+                    NSVisualEffectStateActive,
                     NSTextField, NSTextAlignmentCenter,
                     NSFontAttributeName, NSForegroundColorAttributeName,
                     NSKernAttributeName,
@@ -83,7 +94,7 @@ _VPAD     = 14          # vertical padding of the two line pill
 _GAP      = 4           # between the caption and the words under it
 _MIN_W    = 132
 _MAX_W    = 460         # a preview wider than this gets trimmed instead
-_RING     = 2.5         # rainbow ring thickness
+_RING     = 2.5         # accent ring thickness
 _EDGE_GAP = 14          # distance from the screen edge
 _CURSOR   = 24          # gap between the pointer and the pill
 _FOLLOW   = 0.04        # pointer catch up, and how soon a keypress is felt
@@ -95,7 +106,6 @@ _BLOOM    = 0.75        # how long the words take to rise and settle
 _RISE     = 9.0         # how far below their place the words start
 
 _PREVIEW_WORDS = 8      # most words of the transcript ever shown
-_RING_QUIET    = 0.26   # ring opacity while the words hold the spectrum
 
 # Ride along to every Space, including another app's full screen one.
 #
@@ -164,25 +174,61 @@ def _reduce_motion():
         return False
 
 
-# one full trip of the rainbow, seconds per loop
+# one full trip of the ring, seconds per loop
 _SPEED_REC   = 4.0
 _SPEED_BUSY  = 1.3
 _SPEED_FLASH = 2.4
 _SPEED_WORDS = 7.0      # through the glyphs, slow enough to read over
 
 
-def _rainbow_cgcolors():
-    """Two full hue cycles plus a closing color, so sliding the gradient
-    by half its width lands on an identical frame and the loop is
-    seamless."""
-    cols = []
-    for _ in range(2):
-        for i in range(6):
-            c = NSColor.colorWithHue_saturation_brightness_alpha_(
-                i / 6.0, 0.9, 1.0, 1.0)
-            cols.append(c.CGColor())
+# ── Palette ────────────────────────────────────────────────────────────────
+# Taken from the desktop this pill sits on rather than invented for it: the
+# frosted slate of the widgets down the left edge, the teal of the water
+# under Bixby Bridge, and the pale blue of the menu bar. The pill was a
+# black capsule under a rolling rainbow, which matched nothing else on the
+# screen; the ring still drifts, because its speed is how the pill says
+# whether it is listening or working, but it drifts through water now.
+
+_GROUND      = (0.118, 0.157, 0.204, 0.58)   # slate wash over the blur
+_ACCENT_DEEP = (0.176, 0.376, 0.451)         # the deep water past the rocks
+_ACCENT_MID  = (0.180, 0.541, 0.596)         # the shallows off the point
+_ACCENT_HIGH = (0.478, 0.702, 0.855)         # the menu bar and the sky
+_SHEEN       = (0.847, 0.906, 0.965)         # the light that crosses the words
+_TEXT        = (1.0, 0.94)
+_TEXT_QUIET  = (1.0, 0.50)
+_TEXT_GLOW   = (1.0, 0.55)
+
+
+def _rgb(c):
+    """A palette triple, or a (white, alpha) pair, as an NSColor."""
+    if len(c) == 2:
+        return NSColor.colorWithWhite_alpha_(c[0], c[1])
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(
+        c[0], c[1], c[2], c[3] if len(c) > 3 else 1.0)
+
+
+def _cycle_cgcolors(cycle):
+    """Two turns of a colour cycle plus a closing stop, so sliding the
+    gradient by half its width lands on an identical frame and the loop is
+    seamless. The cycle has to tile, meaning its last stop leads back into
+    its first, or the two turns meet at a visible seam."""
+    cols = [_rgb(c).CGColor() for c in cycle] * 2
     cols.append(cols[0])
     return cols
+
+
+def _ring_cgcolors():
+    """The ring: deep water rising to the shallows, to the sky, and back."""
+    return _cycle_cgcolors([_ACCENT_DEEP, _ACCENT_MID,
+                            _ACCENT_HIGH, _ACCENT_MID])
+
+
+def _words_cgcolors():
+    """The transcript: white, with a slow sheen crossing it. The words are
+    still the thing being shown off, but on this desktop every number that
+    matters is plain white, so the colour in them is a highlight moving over
+    white rather than a colour of their own."""
+    return _cycle_cgcolors([(1.0, 1.0), _SHEEN])
 
 
 class _Ticker:
@@ -228,16 +274,17 @@ class RecordingHUD:
     def __init__(self):
         self._panel      = None
         self._label      = None      # single line states
-        self._pill       = None      # black rounded backdrop layer
+        self._blur       = None      # backdrop blur, the pill's ground
+        self._pill       = None      # slate wash over the blur
         self._ring       = None      # layer holding the gradient, masked
         self._ring_mask  = None      # stroke shaped mask for the ring
-        self._grad       = None      # the moving rainbow in the ring
+        self._grad       = None      # the moving water in the ring
         self._caption    = None      # "copied to clipboard"
         self._bloom      = None      # the pair below, rising and fading in
         self._glow       = None      # halo cast from the glyph shapes
         self._wrap       = None      # masked to the words
         self._words_mask = None      # the transcript preview, as a mask
-        self._words      = None      # the moving rainbow inside the words
+        self._words      = None      # the sheen crossing the words
         self._mode       = 'line'
         self._width      = _MIN_W
         self._height     = _HEIGHT
@@ -381,16 +428,33 @@ class RecordingHUD:
         panel.setIgnoresMouseEvents_(True)
         panel.setHidesOnDeactivate_(False)
         panel.setCollectionBehavior_(_BEHAVIOR)
-        view = panel.contentView()
-        view.setWantsLayer_(True)
+
+        # The ground is a real backdrop blur, which is what every widget on
+        # this desktop is and what a flat dark rectangle can never look like
+        # over a bright wallpaper. The material is pinned to the dark
+        # vibrant appearance rather than following the system, so the pill
+        # reads the same in Light mode, where the menu bar is pale and the
+        # widgets are still dark.
+        blur = NSVisualEffectView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, self._width, _HEIGHT))
+        blur.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        blur.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        blur.setState_(NSVisualEffectStateActive)
+        blur.setAppearance_(
+            NSAppearance.appearanceNamed_('NSAppearanceNameVibrantDark'))
+        blur.setWantsLayer_(True)
+        blur.layer().setMasksToBounds_(True)
+        blur.layer().setCornerRadius_(_HEIGHT / 2.0)
+        panel.setContentView_(blur)
+        view = blur
         scale = panel.backingScaleFactor() or 2.0
 
         pill = CALayer.layer()
-        # opaque, not the 0.94 it used to be. Six percent of whatever is
-        # behind still reads as ghost text against a ground this dark,
-        # and the words need clean black to glow off
-        pill.setBackgroundColor_(NSColor.colorWithSRGBRed_green_blue_alpha_(
-            0.02, 0.02, 0.03, 1.0).CGColor())
+        # A wash over the blur rather than a solid fill, so what is behind
+        # still comes through the way it does under a widget. Dark enough
+        # that white text holds over the brightest part of a wallpaper, and
+        # that the glow around the words has something to glow off.
+        pill.setBackgroundColor_(_rgb(_GROUND).CGColor())
         pill.setCornerRadius_(_HEIGHT / 2.0)
         view.layer().addSublayer_(pill)
 
@@ -403,7 +467,7 @@ class RecordingHUD:
         ring.setMask_(mask)
 
         grad = CAGradientLayer.layer()
-        grad.setColors_(_rainbow_cgcolors())
+        grad.setColors_(_ring_cgcolors())
         grad.setStartPoint_((0.0, 0.5))
         grad.setEndPoint_((1.0, 0.5))
         ring.addSublayer_(grad)
@@ -412,7 +476,7 @@ class RecordingHUD:
         label = NSTextField.labelWithString_('')
         label.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(
             13.0, 0.23))  # 0.23 = NSFontWeightMedium
-        label.setTextColor_(NSColor.colorWithWhite_alpha_(1.0, 0.92))
+        label.setTextColor_(_rgb(_TEXT))
         label.setAlignment_(NSTextAlignmentCenter)
         view.addSubview_(label)
 
@@ -427,7 +491,7 @@ class RecordingHUD:
         # themselves, which is why it is a text layer and not a shadow on
         # the wrapper: a shadow set on a masked layer is thrown by the
         # layer's rectangle, and that hazes the whole pill. Then the
-        # words wrapper is masked to the text, so the rainbow sliding
+        # words wrapper is masked to the text, so the sheen sliding
         # inside it travels along letters that hold still.
         bloom = CALayer.layer()
         bloom.setHidden_(True)
@@ -450,14 +514,14 @@ class RecordingHUD:
         wrap.setMask_(words_mask)
 
         words = CAGradientLayer.layer()
-        words.setColors_(_rainbow_cgcolors())
+        words.setColors_(_words_cgcolors())
         words.setStartPoint_((0.0, 0.5))
         words.setEndPoint_((1.0, 0.5))
         wrap.addSublayer_(words)
         bloom.addSublayer_(wrap)
         view.layer().addSublayer_(bloom)
 
-        self._panel, self._label = panel, label
+        self._panel, self._label, self._blur = panel, label, blur
         self._pill, self._ring, self._ring_mask, self._grad = \
             pill, ring, mask, grad
         self._caption, self._bloom, self._glow, self._wrap = \
@@ -525,16 +589,21 @@ class RecordingHUD:
         self._label.setHidden_(True)
         self._caption.setHidden_(False)
         self._bloom.setHidden_(False)
-        self._ring.setOpacity_(_RING_QUIET)
+        # The ring holds its colour here. It used to drop almost out of
+        # sight because the words took the spectrum off it, and there is no
+        # spectrum to hand over any more: the ring is the only colour on the
+        # pill and the words are white, the way every figure on this desktop
+        # is white.
+        self._ring.setOpacity_(1.0)
 
         cap_attr = _attributed('copied to clipboard', self._caption_font,
-                               NSColor.colorWithWhite_alpha_(1.0, 0.5), 1.4)
+                               _rgb(_TEXT_QUIET), 1.4)
         wrd_attr = _attributed(preview, self._words_font,
                                NSColor.whiteColor())
         # the halo is thrown by these glyphs and then hidden underneath
-        # the coloured ones, so only its spill is ever seen
+        # the lit ones, so only its spill is ever seen
         glow_attr = _attributed(preview, self._words_font,
-                                NSColor.colorWithWhite_alpha_(1.0, 0.55))
+                                _rgb(_TEXT_GLOW))
         cap_size, wrd_size = cap_attr.size(), wrd_attr.size()
         self._caption.setString_(cap_attr)
         self._glow.setString_(glow_attr)
@@ -570,6 +639,8 @@ class RecordingHUD:
             NSMakeRect(cx - w / 2.0, cy - h / 2.0, w, h), True)
 
         radius = min(w, h) / 2.0
+        self._blur.setFrame_(NSMakeRect(0, 0, w, h))
+        self._blur.layer().setCornerRadius_(radius)
         self._pill.setFrame_(CGRectMake(0, 0, w, h))
         self._pill.setCornerRadius_(radius)
         self._ring.setFrame_(CGRectMake(0, 0, w, h))

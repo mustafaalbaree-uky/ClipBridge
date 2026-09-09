@@ -15,11 +15,11 @@ through Carbon (RegisterEventHotKey), so it needs no Input Monitoring
 permission and works everywhere, including Terminal. While recording the
 menu bar icon becomes a red dot; while transcribing, an ellipsis. A small
 on screen pill (hud.py) also appears for the whole voice note flow: a
-black capsule ringed by a drifting rainbow, slow while recording with an
-elapsed counter, fast while transcribing. When the transcript lands it
-opens into two lines: a quiet "copied to clipboard" over the first few
-words of what you said, with the spectrum moving out of the ring and into
-the words themselves. It rides just below the mouse pointer and follows
+frosted slate capsule ringed in drifting water colour, slow while
+recording with an elapsed counter, fast while transcribing. When the
+transcript lands it opens into two lines: a quiet "copied to clipboard"
+over the first few words of what you said, which rise into place under a
+halo with a slow sheen crossing them. It rides just below the mouse pointer and follows
 it, staying clamped inside the screen the pointer is on. Voice note
 status never uses notification banners; those are kept for clipboard
 sync only.
@@ -27,21 +27,29 @@ sync only.
 Recording is done by AVAudioRecorder, which writes straight into
 ~/.clipbridge/pending/partial, so the audio is on disk while it is still
 being spoken rather than only after the fact, and moves up into
-~/.clipbridge/pending the moment recording stops. The file is deleted once it
-transcribes; anything left there is a note whose upload failed, so a note
-recorded offline, or one interrupted by a crash, survives. A background
-sweep retries them on its own and deletes each one the moment it works.
+~/.clipbridge/pending the moment recording stops. Once it transcribes, the
+audio moves to ~/.clipbridge/notes and its text is written beside it as a
+.txt of the same name, so a transcript can be put back on the clipboard
+without spending another upload, and a transcript that came back wrong can
+be run again from the audio it came from. Five notes are kept, so filing a
+sixth deletes the oldest, audio and text together. Anything left in
+pending is a note whose upload failed, so a note recorded offline, or one
+interrupted by a crash, survives. A background sweep retries them on its own
+and files each one under notes the moment it works.
 
 Menu:
     Send to PC       push the current clipboard to the PC, instantly
     Fetch Now        one shot fetch of the latest incoming clip
     Record Note      toggle recording (same as the hotkey)
+    Recent Notes     the last five, by date and time; click one to copy
+                     its transcript back to the clipboard
+    Notes Folder     open the folder holding transcribed recordings
     Retry Pending    upload saved notes now instead of waiting
     Auto: ON         toggle background polling
     Quit
 
-Voice notes are processed by shared/noteproc.py: silences truncated,
-long audio chunked at quiet points and transcribed in parallel.
+Voice notes are processed by shared/noteproc.py: long audio chunked at
+quiet points and transcribed in parallel.
 
 Run directly:   .venv/bin/python3 clipbridge.py
 Build the app:  ./build.sh  (output: dist/ClipBridge.app)
@@ -55,6 +63,7 @@ import sys
 import threading
 import time
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import rumps
@@ -149,6 +158,13 @@ PENDING_DIR       = Path.home() / '.clipbridge' / 'pending'
 # its container from the file extension, and an extension it does not know
 # gets it a CAF file, which then wore a .wav name once it was moved.
 PARTIAL_DIR       = PENDING_DIR / 'partial'
+# Where a note goes once its text has come back. The audio outlives the
+# transcript so a bad one can be run again, rather than the recording being
+# the thing that is lost.
+NOTES_DIR         = Path.home() / '.clipbridge' / 'notes'
+# How many notes survive, newest first. The transcript is written beside the
+# audio, so a note is the pair and they are pruned together.
+NOTES_KEEP        = 5
 PENDING_MAX_FILES = 40
 PENDING_MAX_DAYS  = 7
 RETRY_SEC         = 60
@@ -440,6 +456,111 @@ def _discard_pending(path):
         pass
 
 
+def _keep_note(path, text=None):
+    """File a note whose text came back: the audio moves into NOTES_DIR and
+    the transcript is written beside it. Keeping the text is what lets a note
+    be put back on the clipboard later without another upload, and keeping the
+    audio is what lets a bad transcript be run again. Falls back to deleting
+    only if the move itself fails."""
+    if not path:
+        return None
+    path = Path(path)
+    try:
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        kept = NOTES_DIR / path.name
+        if kept.exists():
+            kept = NOTES_DIR / f'{path.stem}-{int(time.time() * 1000)}{path.suffix}'
+        path.rename(kept)
+        _write_note_text(kept, text)
+        _prune_notes()
+        return kept
+    except Exception:
+        _discard_pending(path)
+        return None
+
+
+# ── Saved notes ────────────────────────────────────────────────────────────────
+# Each note is a pair: the .wav it was spoken into and a .txt of the same name
+# holding what came back. The text is what the Recent Notes menu hands back to
+# the clipboard; the audio is the fallback when there is no text yet, and the
+# reason a note recorded before this existed can still be recovered.
+
+def _note_text_path(wav):
+    return Path(wav).with_suffix('.txt')
+
+
+def _write_note_text(wav, text):
+    """Save a transcript beside its audio. An empty transcript writes nothing,
+    so 'the worker heard nothing' and 'this note has no text yet' stay the same
+    thing: both are answered by transcribing the audio again."""
+    if not text:
+        return None
+    try:
+        out = _note_text_path(wav)
+        out.write_text(text, encoding='utf-8')
+        return out
+    except Exception:
+        return None
+
+
+def _read_note_text(wav):
+    """The saved transcript, or None when there is not one to read."""
+    try:
+        txt = _note_text_path(wav)
+        if txt.is_file():
+            body = txt.read_text(encoding='utf-8').strip()
+            return body or None
+    except Exception:
+        pass
+    return None
+
+
+def _note_time(wav):
+    """When the note was spoken, from its own name. Every recording is named
+    note-YYYYMMDD-HHMMSS-mmm.wav at the moment the microphone comes up, so the
+    name is the recording time and the file's mtime is when the write finished.
+    A name that does not parse falls back to the mtime."""
+    wav = Path(wav)
+    parts = wav.stem.split('-')
+    if len(parts) >= 3:
+        try:
+            return time.mktime(time.strptime(f'{parts[1]}-{parts[2]}',
+                                             '%Y%m%d-%H%M%S'))
+        except Exception:
+            pass
+    try:
+        return wav.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _note_label(ts, with_seconds=False):
+    """A menu title for a note: the day and the time, never the filename.
+    Recent days are named rather than dated, since 'Yesterday 9:04 AM' is the
+    thing being looked for and 'note-20260908-090412-202' is not."""
+    when = time.localtime(ts)
+    clock = time.strftime('%-I:%M:%S %p' if with_seconds else '%-I:%M %p', when)
+    # Counted in calendar days rather than elapsed seconds, so the hour a
+    # clock goes forward cannot turn yesterday into a weekday name.
+    days = (date.today() - date(when.tm_year, when.tm_mon, when.tm_mday)).days
+    if days == 0:
+        day = 'Today'
+    elif days == 1:
+        day = 'Yesterday'
+    elif 0 < days < 7:
+        day = time.strftime('%A', when)
+    else:
+        day = time.strftime('%b %-d,', when)
+    return f'{day} {clock}'
+
+
+def _list_notes():
+    """Saved notes, newest first."""
+    notes = [(p, _note_time(p)) for p in _glob(NOTES_DIR, '*.wav')]
+    notes.sort(key=lambda pair: pair[1], reverse=True)
+    return notes
+
+
 def _list_pending():
     try:
         return sorted(PENDING_DIR.glob('*.wav'), key=lambda p: p.stat().st_mtime)
@@ -463,6 +584,23 @@ def _prune_pending():
     excess = len(kept) - PENDING_MAX_FILES
     for p in kept[:excess] if excess > 0 else []:
         _discard_pending(p)
+
+
+def _prune_notes():
+    """Keep the NOTES_KEEP most recent notes and drop the rest, audio and
+    transcript together. A .txt with no .wav beside it goes too, so a note
+    never half survives its own pruning."""
+    kept = set()
+    for wav, _ in _list_notes()[:NOTES_KEEP]:
+        kept.add(wav)
+        kept.add(_note_text_path(wav))
+    for p in _glob(NOTES_DIR, '*.wav') + _glob(NOTES_DIR, '*.txt'):
+        if p in kept:
+            continue
+        try:
+            p.unlink()
+        except Exception:
+            pass
 
 
 # ── Click routing ──────────────────────────────────────────────────────────────
@@ -500,9 +638,18 @@ class ClipBridge(rumps.App):
         if CAN_RECORD:
             self._record_item = rumps.MenuItem('Record Note',
                                                callback=self._toggle_record)
-            items += [None, self._record_item,
+            self._notes_item = rumps.MenuItem('Recent Notes')
+            # what the submenu currently shows, so it is only rebuilt when the
+            # notes on disk have actually changed
+            self._notes_shown = None
+            items += [None, self._record_item, self._notes_item,
+                      rumps.MenuItem('Notes Folder',
+                                     callback=self._open_notes),
                       rumps.MenuItem('Retry Pending',
                                      callback=self._retry_now)]
+        else:
+            self._notes_item  = None
+            self._notes_shown = None
         items += [
             None,
             self._auto_item,
@@ -539,6 +686,8 @@ class ClipBridge(rumps.App):
         threading.Thread(target=self._poll, daemon=True).start()
         if CAN_RECORD:
             _recover_part_files()
+            _prune_notes()
+            self._rebuild_notes_menu()
             threading.Thread(target=self._retry_loop, daemon=True).start()
         self._hotkey_handle = None
         # Asked for once per launch. An install deletes /Applications/
@@ -618,6 +767,7 @@ class ClipBridge(rumps.App):
             self._send_to_pc(None)
 
     def _pop_menu(self):
+        self._rebuild_notes_menu()
         try:
             item = self._nsapp.nsstatusitem
             btn  = item.button()
@@ -880,8 +1030,11 @@ class ClipBridge(rumps.App):
             audio, sr = sf.read(str(final), dtype='float32')
             text = noteproc.transcribe_note(audio, sr, WORKER_URL)
             # the worker answered, so there is nothing left to retry, even
-            # when it heard nothing at all
-            _discard_pending(final)
+            # when it heard nothing at all. The audio moves to NOTES_DIR with
+            # its text beside it, so the note can be copied again without
+            # another upload and a poor transcript can be run again.
+            _keep_note(final, text)
+            _on_main(self._rebuild_notes_menu)
             if text:
                 _copy(text)
                 self._hud_copied(text)
@@ -915,6 +1068,7 @@ class ClipBridge(rumps.App):
 
     def _sweep_once(self):
         _prune_pending()
+        _prune_notes()
         recovered = 0
         for path in _list_pending():
             if self._rec_on:
@@ -932,7 +1086,8 @@ class ClipBridge(rumps.App):
                 text = noteproc.transcribe_note(audio, sr, WORKER_URL)
             except Exception:
                 break
-            _discard_pending(path)
+            _keep_note(path, text)
+            _on_main(self._rebuild_notes_menu)
             if text:
                 recovered += 1
                 _copy(text)
@@ -955,6 +1110,104 @@ class ClipBridge(rumps.App):
                 self._sweep_pending()
             except Exception:
                 pass
+
+    # ── Recent notes ───────────────────────────────────────────────────────────
+
+    def _rebuild_notes_menu(self):
+        """Fill the Recent Notes submenu from what is on disk. Runs just
+        before the menu opens and again whenever a note is filed, so it can
+        never offer a note that has been pruned or omit one that just landed.
+
+        Rebuilding only when the folder has actually changed keeps a menu
+        opened repeatedly from stacking up NSMenuItems that rumps holds a
+        reference to for the life of the app."""
+        if self._notes_item is None:
+            return
+        notes = _list_notes()[:NOTES_KEEP]
+        shown = [(str(wav), ts, _note_text_path(wav).is_file())
+                 for wav, ts in notes]
+        if shown == self._notes_shown:
+            return
+        try:
+            if self._notes_item._menu is not None:
+                self._notes_item.clear()
+        except Exception:
+            pass
+        if not notes:
+            # An empty submenu greys its parent out, which is the standard way
+            # a menu says there is nothing under it. A placeholder item cannot
+            # do that job: an inert row is drawn greyed too, and a submenu with
+            # nothing enabled in it does not open to show the row at all.
+            self._notes_shown = shown
+            return
+        # Two notes in the same minute read alike to the minute, so both are
+        # shown to the second rather than one of the pair being the odd one.
+        labels = [_note_label(ts) for _, ts in notes]
+        clashes = {t for t in labels if labels.count(t) > 1}
+        used = set()
+        for (wav, ts), label in zip(notes, labels):
+            title = _note_label(ts, with_seconds=True) if label in clashes \
+                    else label
+            # rumps keys a menu item by its title and silently drops a second
+            # item under a title already taken, so a title has to be unique
+            # whatever the clock says. A hair space is padding that makes it
+            # so without changing what the item reads as.
+            while title in used:
+                title += '\u200a'
+            used.add(title)
+            item = rumps.MenuItem(title)
+            item.set_callback(
+                lambda _sender, path=wav: self._replay_note(path))
+            self._notes_item.add(item)
+        self._notes_shown = shown
+
+    def _replay_note(self, wav):
+        """Put a saved note back on the clipboard. The transcript beside the
+        audio is what is normally handed back. A note recorded before
+        transcripts were saved, or one whose text never landed, has only the
+        audio, so that is transcribed again and the text kept this time."""
+        wav = Path(wav)
+        text = _read_note_text(wav)
+        if text:
+            _copy(text)
+            self._hud_copied(text)
+            return
+        if not wav.is_file():
+            self._hud_flash('That note is gone.')
+            _on_main(self._rebuild_notes_menu)
+            return
+        if self._rec_on or self._rec_opening:
+            self._hud_flash('Already recording.')
+            return
+        self._set_state('busy')
+        if self._hud:
+            self._hud.processing()
+        threading.Thread(target=self._replay_worker, args=(wav,),
+                         daemon=True).start()
+
+    def _replay_worker(self, wav):
+        try:
+            audio, sr = sf.read(str(wav), dtype='float32')
+            text = noteproc.transcribe_note(audio, sr, WORKER_URL)
+        except Exception as e:
+            self._set_state('idle')
+            self._hud_flash(str(e), seconds=3.0)
+            return
+        self._set_state('idle')
+        if text:
+            _write_note_text(wav, text)
+            _copy(text)
+            self._hud_copied(text)
+            _on_main(self._rebuild_notes_menu)
+        else:
+            self._hud_flash('Nothing heard.')
+
+    def _open_notes(self, _):
+        try:
+            NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        subprocess.run(['open', str(NOTES_DIR)])
 
     def _retry_now(self, _):
         threading.Thread(target=self._sweep_pending, daemon=True).start()

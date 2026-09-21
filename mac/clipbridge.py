@@ -24,6 +24,28 @@ it, staying clamped inside the screen the pointer is on. Voice note
 status never uses notification banners; those are kept for clipboard
 sync only.
 
+Notes can overlap. Pressing the hotkey while a note is still transcribing
+starts the next one, and its pill appears under the pointer while the
+older pills slide down beneath it, as many as you like. Transcripts reach
+the clipboard in the order they were recorded, one at a time: the oldest
+note not yet pasted holds the clipboard, and a note that finishes behind
+it waits in its pill, dimmed and captioned "queued", until that one is
+pasted. Then it takes the clipboard. A paste is seen without watching the
+keyboard: the transcript goes on the clipboard as a promise, macOS asks
+ClipBridge for the text at the moment something pastes it, and that request
+is the paste. If something else is copied over a waiting note instead, the
+queue stops there, and Next Note in the menu moves it on.
+
+A note can be pinned to a text field instead (pin.py): the pin hotkey, or
+control option click on a field, types a marker such as ⟦note 1⟧ at the
+cursor, and the transcript replaces the marker when it arrives, wherever
+you have gone since. A note that is already transcribed is typed at the
+cursor with no marker. In a terminal the marker is swapped by keystrokes
+once the screen shows the cursor sitting right after it; when that cannot
+be seen the marker stays, and pin_hook.py gives Claude Code the transcript
+when the prompt is sent. A pin that goes nowhere puts its note back in the
+clipboard queue.
+
 Recording is done by AVAudioRecorder, which writes straight into
 ~/.clipbridge/pending/partial, so the audio is on disk while it is still
 being spoken rather than only after the fact, and moves up into
@@ -41,15 +63,20 @@ Menu:
     Send to PC       push the current clipboard to the PC, instantly
     Fetch Now        one shot fetch of the latest incoming clip
     Record Note      toggle recording (same as the hotkey)
+    Next Note        skip the queued note on the clipboard, or restart a
+                     queue stopped by something else being copied
     Recent Notes     the last five, by date and time; click one to copy
                      its transcript back to the clipboard
     Notes Folder     open the folder holding transcribed recordings
-    Retry Pending    upload saved notes now instead of waiting
+    Retry Pending    transcribe saved notes now instead of waiting
     Auto: ON         toggle background polling
     Quit
 
-Voice notes are processed by shared/noteproc.py: long audio chunked at
-quiet points and transcribed in parallel.
+Voice notes are transcribed on this machine by whisper.cpp, through
+shared/localasr.py. It runs the same model the worker does, so the text
+is the same and the wifi cannot hold it up. The worker path
+(shared/noteproc.py: long audio chunked at quiet points and uploaded in
+parallel) is what runs when whisper.cpp or its model is not installed.
 
 Run directly:   .venv/bin/python3 clipbridge.py
 Build the app:  ./build.sh  (output: dist/ClipBridge.app)
@@ -73,7 +100,8 @@ try:
     import objc
     from Foundation import NSObject, NSMakePoint
     from AppKit import (NSApp, NSEventTypeRightMouseUp, NSEventMaskLeftMouseUp,
-                        NSEventMaskRightMouseUp, NSEventModifierFlagControl)
+                        NSEventMaskRightMouseUp, NSEventModifierFlagControl,
+                        NSPasteboard, NSPasteboardItem, NSPasteboardTypeString)
     from PyObjCTools import AppHelper
     HAS_APPKIT = True
 except Exception:
@@ -106,14 +134,24 @@ except Exception:
     noteproc = None
 
 try:
-    from hud import RecordingHUD
+    import localasr
 except Exception:
-    RecordingHUD = None
+    localasr = None
+
+try:
+    from hud import RecordingHUD, PillStack
+except Exception:
+    RecordingHUD = PillStack = None
 
 try:
     import loginitem
 except Exception:
     loginitem = None
+
+try:
+    import pin
+except Exception:
+    pin = None
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -146,7 +184,13 @@ SUPA_ANON    = _cfg['supabase_anon_key']
 SUPA_HEADERS = {'apikey': SUPA_ANON, 'Authorization': f'Bearer {SUPA_ANON}'}
 POLL_SEC     = int(_cfg.get('poll_seconds', 3))
 WORKER_URL   = _cfg.get('transcribe_worker_url', '')
+if localasr is not None:
+    localasr.configure(_cfg.get('whisper_cli_path'),
+                       _cfg.get('whisper_model_path'),
+                       _cfg.get('whisper_vocabulary'))
+LOCAL_ASR    = localasr is not None and localasr.available()
 HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
+PIN_HOTKEY   = _cfg.get('pin_hotkey', '<ctrl>+<alt>+v')
 SAMPLERATE   = 16000
 
 # Recordings waiting on a transcription that has not succeeded yet. Bounded
@@ -162,6 +206,10 @@ PARTIAL_DIR       = PENDING_DIR / 'partial'
 # transcript so a bad one can be run again, rather than the recording being
 # the thing that is lost.
 NOTES_DIR         = Path.home() / '.clipbridge' / 'notes'
+# One file per pinned note, named by its marker number, read by pin_hook.py.
+PINS_DIR          = Path.home() / '.clipbridge' / 'pins'
+PINS_KEEP_DAYS    = 2
+PIN_ABANDON_SEC   = 3600
 # How many notes survive, newest first. The transcript is written beside the
 # audio, so a note is the pair and they are pruned together.
 NOTES_KEEP        = 5
@@ -182,8 +230,32 @@ WAV_MIN_SEC       = 0.35
 # a recording of no length at all still weighs this much on disk.
 WAV_HEADER_BYTES  = 4096
 WAV_MIN_BYTES     = WAV_HEADER_BYTES + int(SAMPLERATE * 2 * WAV_MIN_SEC)
+# How long a transcript's pill stays up when no note is waiting behind it.
+COPIED_LINGER_SEC = 2.9
+# How long after a paste the next note waits before taking the clipboard.
+# The app that pasted already has its text by then, and this covers one
+# that asks a second time for the same paste.
+PASTE_SETTLE_SEC  = 0.3
+# How often the clipboard is checked for something else copied over a note
+# that is waiting to be pasted.
+CLIP_WATCH_SEC    = 0.5
 
-CAN_RECORD = bool(WORKER_URL) and HAS_AUDIO and noteproc is not None
+# Either engine will do. The worker needs noteproc to chunk for it;
+# whisper.cpp does its own windowing and needs nothing but the file.
+CAN_RECORD = HAS_AUDIO and (
+    LOCAL_ASR or (bool(WORKER_URL) and noteproc is not None))
+
+
+def _transcribe(path):
+    """The text of a recording. whisper.cpp on this machine when it is
+    installed, and the worker only when it is not, because the two run the
+    same model and only one of them can be held up by the network."""
+    if LOCAL_ASR:
+        return localasr.transcribe(str(path))
+    if not (WORKER_URL and noteproc is not None):
+        raise RuntimeError('no way to transcribe: no whisper.cpp, no worker')
+    audio, sr = sf.read(str(path), dtype='float32')
+    return noteproc.transcribe_note(audio, sr, WORKER_URL)
 
 
 # ── Menu bar icon ──────────────────────────────────────────────────────────────
@@ -325,6 +397,16 @@ def _on_main(fn, *args):
         AppHelper.callAfter(fn, *args)
     except Exception:
         fn(*args)
+
+
+def _debug_line(msg):
+    try:
+        with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'a', encoding='utf-8') as f:
+            f.write(f'\n{msg} {time.strftime("%H:%M:%S")}')
+    except Exception:
+        pass
+
+
 
 
 def _parse_hotkey(spec):
@@ -485,6 +567,75 @@ def _keep_note(path, text=None):
 # the clipboard; the audio is the fallback when there is no text yet, and the
 # reason a note recorded before this existed can still be recovered.
 
+def _pin_waiting(rec, now):
+    """A pin still owed somewhere: its transcript has not been swapped into a
+    field or read by the hook. One left alone for PIN_ABANDON_SEC is taken as
+    a marker that was deleted rather than sent."""
+    return (rec.get('waiting', True)
+            and now - rec.get('time', 0) < PIN_ABANDON_SEC)
+
+
+def _next_pin_number():
+    """Back to 1 once no pin is waiting. While one is, keep counting up, so a
+    marker still in an unsent prompt never names a newer note."""
+    counter = PINS_DIR / 'last'
+    now = time.time()
+    try:
+        PINS_DIR.mkdir(parents=True, exist_ok=True)
+        last = int(counter.read_text(encoding='utf-8').strip() or 0)
+    except Exception:
+        last = 0
+    waiting = False
+    for f in _glob(PINS_DIR, '*.json'):
+        try:
+            if _pin_waiting(json.loads(f.read_text(encoding='utf-8')), now):
+                waiting = True
+                break
+        except Exception:
+            continue
+    number = last + 1 if waiting else 1
+    try:
+        counter.write_text(str(number), encoding='utf-8')
+    except Exception:
+        pass
+    return number
+
+
+def _pin_sent(number):
+    """Whether pin_hook.py has handed this pin's marker to Claude Code."""
+    try:
+        rec = json.loads((PINS_DIR / f'{number}.json').read_text(encoding='utf-8'))
+        return rec.get('waiting') is False
+    except Exception:
+        return False
+
+
+def _write_pin(number, state, text=None, waiting=True):
+    """state is pending, ready, or failed; waiting is cleared once the
+    transcript has landed. pin_hook.py clears it too, when it hands a
+    transcript to Claude Code. Written to a temporary name and renamed, so
+    neither side ever reads half a file."""
+    try:
+        PINS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PINS_DIR / f'{number}.json.tmp'
+        tmp.write_text(json.dumps({'state': state, 'text': text,
+                                   'waiting': waiting, 'time': time.time()}),
+                       encoding='utf-8')
+        tmp.replace(PINS_DIR / f'{number}.json')
+    except Exception as e:
+        _debug_line(f'pin file {number} not written: {e}')
+
+
+def _prune_pins():
+    cutoff = time.time() - PINS_KEEP_DAYS * 86400
+    for p in _glob(PINS_DIR, '*.json'):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except Exception:
+            pass
+
+
 def _note_text_path(wav):
     return Path(wav).with_suffix('.txt')
 
@@ -621,6 +772,93 @@ if HAS_APPKIT:
         def statusItemClicked_(self, sender):
             self._owner._handle_status_click()
 
+    class _ClipPromise(NSObject, protocols=[
+            objc.protocolNamed('NSPasteboardItemDataProvider')]):
+        """A transcript on the clipboard that is handed over only when
+        something pastes it, so the handing over is the paste."""
+
+        def initWithOwner_note_(self, owner, note):
+            self = objc.super(_ClipPromise, self).init()
+            if self is None:
+                return None
+            self._owner  = owner
+            self._note   = note
+            self._served = False
+            return self
+
+        def pasteboard_item_provideDataForType_(self, pasteboard, item, type_):
+            text = self._note.text or ''
+            # a note behind this one means both are headed for the same
+            # paste, one after the other, so give them a space rather than
+            # running the two transcripts together
+            if text and self._owner._behind_head():
+                text += ' '
+            item.setString_forType_(text, type_)
+            if not self._served:
+                self._served = True
+                AppHelper.callLater(PASTE_SETTLE_SEC,
+                                    self._owner._note_pasted, self._note)
+
+
+# ── Notes in flight ────────────────────────────────────────────────────────────
+
+class _Note:
+    """One voice note between the hotkey and the clipboard, with the pill
+    that shows where it is."""
+    __slots__ = ('pill', 'state', 'text', 'held', 'pin', 'missed')
+
+    def __init__(self, pill):
+        self.pill  = pill
+        self.state = 'recording'     # recording, transcribing, ready, copied
+        self.text  = None
+        # a copied note whose pill is kept up because a note is behind it
+        self.held  = False
+        # set when the transcript goes into a text field instead of the queue
+        self.pin   = None
+        self.missed = False     # a pin that went nowhere, now on the clipboard
+
+
+class _NoPill:
+    """Stands in for a pill when the HUD could not be built, so the queue
+    runs the same way and reports through notifications instead."""
+    on_gone = None
+
+    def recording(self):
+        pass
+
+    def processing(self):
+        pass
+
+    def queued(self, transcript):
+        pass
+
+    def pasted(self, transcript, caption='pasted', seconds=COPIED_LINGER_SEC):
+        _notify(transcript, title=caption)
+        self.hide()
+
+    def hold(self):
+        pass
+
+    def linger(self, seconds=COPIED_LINGER_SEC):
+        self.hide()
+
+    def flash(self, text, seconds=1.8):
+        _notify(text, title='ClipBridge')
+        self.hide()
+
+    def failed(self, text, seconds=3.0):
+        self.flash(text, seconds)
+
+    def copied(self, transcript, seconds=COPIED_LINGER_SEC):
+        _notify(transcript, title='Copied to clipboard')
+        if seconds is not None:
+            self.hide()
+
+    def hide(self):
+        callback, self.on_gone = self.on_gone, None
+        if callback is not None:
+            _on_main(callback)
+
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
@@ -638,16 +876,19 @@ class ClipBridge(rumps.App):
         if CAN_RECORD:
             self._record_item = rumps.MenuItem('Record Note',
                                                callback=self._toggle_record)
+            # no callback until there is a queue to move, which greys it out
+            self._next_item = rumps.MenuItem('Next Note')
             self._notes_item = rumps.MenuItem('Recent Notes')
             # what the submenu currently shows, so it is only rebuilt when the
             # notes on disk have actually changed
             self._notes_shown = None
-            items += [None, self._record_item, self._notes_item,
+            items += [None, self._record_item, self._next_item, self._notes_item,
                       rumps.MenuItem('Notes Folder',
                                      callback=self._open_notes),
                       rumps.MenuItem('Retry Pending',
                                      callback=self._retry_now)]
         else:
+            self._next_item   = None
             self._notes_item  = None
             self._notes_shown = None
         items += [
@@ -670,23 +911,41 @@ class ClipBridge(rumps.App):
         # instead of turning into a phantom recording.
         self._rec_opening = False
         self._rec_gen     = 0
-        self._hud = None
+        self._pills = None
+        # every note not yet pasted, oldest first, including the one being
+        # recorded. Touched on the main thread only.
+        self._notes    = []
+        self._rec_note = None
+        self._replaying = False
+        # the note on the clipboard as a promise, the pasteboard's change
+        # count right after it went there, and the timer comparing the two
+        self._offer_note  = None
+        self._offer_count = None
+        self._clip_timer  = None
+        self._promises    = []
+        # set when something else was copied over a waiting note, which
+        # stops the queue until Next Note
+        self._paused      = False
         # notes the live upload is holding, so the retry sweep leaves them be
         self._inflight      = set()
         self._inflight_lock = threading.Lock()
+        # notes pinned to a text field, out of the queue, until delivered
+        self._pinned    = []
+        self._tap       = None
         self._sweep_lock    = threading.Lock()
         hud_note = 'off, no AppKit' if not HAS_APPKIT else \
-                   'off, hud.py did not import' if RecordingHUD is None else 'on'
-        if HAS_APPKIT and RecordingHUD is not None:
+                   'off, hud.py did not import' if PillStack is None else 'on'
+        if HAS_APPKIT and PillStack is not None:
             try:
-                self._hud = RecordingHUD()
+                self._pills = PillStack()
             except Exception as e:
-                self._hud = None
+                self._pills = None
                 hud_note = f'off, {e}'
         threading.Thread(target=self._poll, daemon=True).start()
         if CAN_RECORD:
             _recover_part_files()
             _prune_notes()
+            _prune_pins()
             self._rebuild_notes_menu()
             threading.Thread(target=self._retry_loop, daemon=True).start()
         self._hotkey_handle = None
@@ -701,6 +960,9 @@ class ClipBridge(rumps.App):
             'can_record': CAN_RECORD, 'has_audio': HAS_AUDIO,
             'has_hotkey_lib': HAS_HOTKEY, 'hotkey': HOTKEY,
             'hud': hud_note, 'login_item': login_state,
+            'paste_signal': 'clipboard promise' if HAS_APPKIT else 'off, no AppKit',
+            'local_asr': localasr.describe() if localasr else
+                         'off, localasr.py did not import',
         }
         if CAN_RECORD and HAS_HOTKEY and HOTKEY:
             try:
@@ -718,8 +980,32 @@ class ClipBridge(rumps.App):
             except Exception as e:
                 import traceback
                 diag['register_error'] = traceback.format_exc()
+        self._pin_handle = None
+        diag['pin'] = 'off, pin.py did not import' if pin is None else \
+                      'off, no accessibility bindings' if not pin.HAS_AX else \
+                      f'hotkey {PIN_HOTKEY}, control option click'
+        if CAN_RECORD and HAS_HOTKEY and pin is not None and pin.HAS_AX:
+            diag['accessibility'] = pin.trusted(prompt=True)
+            try:
+                parsed = _parse_hotkey(PIN_HOTKEY)
+                if parsed:
+                    vk, mods = parsed
+
+                    @quickHotKey(virtualKey=vk, modifierMask=mods)
+                    def _fire_pin():
+                        _on_main(self._pin_hotkey_fired)
+
+                    self._pin_handle = _fire_pin
+            except Exception as e:
+                diag['pin_register_error'] = str(e)
+            self._tap = pin.ClickTap(self._pin_target, self._pin_click)
+            # the tap can only be made once Accessibility is granted, which
+            # may happen after launch, so keep trying until it is
+            if not self._tap.start():
+                self._tap_timer = rumps.Timer(self._retry_tap, 3)
+                self._tap_timer.start()
         try:
-            with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'w') as f:
+            with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'w', encoding='utf-8') as f:
                 json.dump(diag, f, indent=2)
         except Exception:
             pass
@@ -880,7 +1166,7 @@ class ClipBridge(rumps.App):
 
     def _hotkey_fired(self):
         try:
-            with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'a') as f:
+            with open(Path.home() / '.clipbridge' / 'mac_debug.log', 'a', encoding='utf-8') as f:
                 f.write(f'\nhotkey fired {time.strftime("%H:%M:%S")}')
         except Exception:
             pass
@@ -909,22 +1195,31 @@ class ClipBridge(rumps.App):
         except Exception:
             apply()
 
-    def _hud_flash(self, text, seconds=1.8):
-        """Short on screen confirmation, falling back to a notification
-        only when the HUD could not be built at all."""
-        if self._hud:
-            self._hud.flash(text, seconds)
+    def _refresh_icon(self):
+        """The menu bar icon for everything going on at once: a recording
+        outranks a transcription, which outranks nothing."""
+        if self._rec_on:
+            self._set_state('rec')
+        elif self._replaying or any(n.state == 'transcribing'
+                                    for n in self._notes + self._pinned):
+            self._set_state('busy')
         else:
-            _notify(text, title='ClipBridge')
+            self._set_state('idle')
+
+    def _pill(self):
+        """A new pill at the top of the stack, under the pointer. Falls
+        back to notifications only when the HUD could not be built at all."""
+        return self._pills.acquire() if self._pills else _NoPill()
+
+    def _hud_flash(self, text, seconds=1.8):
+        """Short on screen confirmation in a pill of its own."""
+        self._pill().flash(text, seconds)
 
     def _hud_copied(self, text):
         """The transcript is on the clipboard. Showing its opening words
         is what makes the confirmation worth reading: it says the note
         was heard, not merely that something finished."""
-        if self._hud:
-            self._hud.copied(text)
-        else:
-            _notify(text, title='Copied to clipboard')
+        self._pill().copied(text)
 
     def _toggle_record(self, _sender):
         if not CAN_RECORD:
@@ -935,7 +1230,8 @@ class ClipBridge(rumps.App):
             # queueing a second recorder behind this one.
             self._rec_gen    += 1
             self._rec_opening = False
-            self._set_state('idle')
+            self._refresh_icon()
+            self._sync_head()
             self._hud_flash('Canceled.')
         elif not self._rec_on:
             # Nothing on this thread may touch audio. Even Apple's recorder
@@ -944,6 +1240,9 @@ class ClipBridge(rumps.App):
             self._rec_opening = True
             self._rec_gen    += 1
             gen = self._rec_gen
+            # a note is on its way, so a transcript still showing has to
+            # wait for its paste from here on
+            self._sync_head()
             threading.Thread(target=self._open_worker, args=(gen,),
                              daemon=True).start()
             threading.Thread(target=self._open_watchdog, args=(gen,),
@@ -952,14 +1251,16 @@ class ClipBridge(rumps.App):
             self._rec_on = False
             rec  = self._recorder
             path = self._rec_path
+            note = self._rec_note
             self._recorder = None
             self._rec_path = None
+            self._rec_note = None
             self._record_item.title = 'Record Note'
-            self._set_state('busy')
-            if self._hud:
-                self._hud.processing()
-            threading.Thread(target=self._finish_note, args=(rec, path),
-                             daemon=True).start()
+            note.state = 'transcribing'
+            note.pill.processing()
+            self._refresh_icon()
+            threading.Thread(target=self._finish_note,
+                             args=(note, rec, path), daemon=True).start()
 
     def _open_worker(self, gen):
         """Bring the recorder up off the main thread, so a microphone that
@@ -995,10 +1296,14 @@ class ClipBridge(rumps.App):
         self._recorder    = rec
         self._rec_path    = path
         self._rec_on      = True
+        note = _Note(self._pill())
+        note.pill.on_gone = lambda n=note: self._note_gone(n)
+        self._rec_note = note
+        self._notes.append(note)
         self._record_item.title = 'Stop Recording'
-        self._set_state('rec')
-        if self._hud:
-            self._hud.recording()
+        self._refresh_icon()
+        note.pill.recording()
+        self._sync_head()
 
     def _open_failed(self, gen, message):
         if gen != self._rec_gen:
@@ -1011,90 +1316,414 @@ class ClipBridge(rumps.App):
         self._recorder    = None
         self._rec_path    = None
         self._record_item.title = 'Record Note'
-        self._set_state('idle')
-        self._hud_flash(f'Could not open the microphone: {message}',
-                        seconds=3.0)
+        self._refresh_icon()
+        self._sync_head()
+        self._pill().failed(f'Could not open the microphone: {message}')
 
-    def _finish_note(self, rec, path):
+    def _finish_note(self, note, rec, path):
         """Stop the recorder, then transcribe what it wrote. The audio is
         already on disk by the time we get here, so a failed upload loses
-        nothing: the file stays and the retry sweep picks it up."""
+        nothing: the file stays and the retry sweep picks it up. What
+        happens to the clipboard is the queue's call, made on the main
+        thread, since another note may be ahead of this one."""
         final = None
         try:
             final = _finish_recorder(rec, path)
             if final is None:
-                self._hud_flash('Nothing recorded.')
+                _on_main(self._note_failed, note, 'Nothing recorded.', 1.8)
                 return
             with self._inflight_lock:
                 self._inflight.add(str(final))
-            audio, sr = sf.read(str(final), dtype='float32')
-            text = noteproc.transcribe_note(audio, sr, WORKER_URL)
-            # the worker answered, so there is nothing left to retry, even
+            text = _transcribe(final)
+            # the transcript came back, so there is nothing left to retry, even
             # when it heard nothing at all. The audio moves to NOTES_DIR with
             # its text beside it, so the note can be copied again without
             # another upload and a poor transcript can be run again.
             _keep_note(final, text)
             _on_main(self._rebuild_notes_menu)
             if text:
-                _copy(text)
-                self._hud_copied(text)
+                _on_main(self._note_ready, note, text)
             else:
-                self._hud_flash('Nothing heard.')
+                _on_main(self._note_failed, note, 'Nothing heard.', 1.8)
         except Exception as e:
-            if final:
-                self._hud_flash(f'{e}. Saved, will retry.', seconds=3.0)
-            else:
-                self._hud_flash(str(e), seconds=3.0)
+            _debug_line(f'note failed: {e}')
+            message = f'{e}. Saved, will retry.' if final else str(e)
+            _on_main(self._note_failed, note, message, 3.0, True)
         finally:
             if final:
                 with self._inflight_lock:
                     self._inflight.discard(str(final))
-            self._set_state('idle')
 
-    def _sweep_pending(self):
+    # ── The queue ──────────────────────────────────────────────────────────────
+    # Transcripts reach the clipboard in the order their notes were recorded.
+    # The oldest note in self._notes owns the clipboard. A note that finishes
+    # behind it waits, dimmed, and takes the clipboard once that one is pasted.
+    # Something else copied over a waiting note stops the queue until Next Note.
+    # A copied note with nothing behind it leaves the way a single pill always
+    # has, after a few seconds or at the next key or click. Main thread only.
+
+    def _behind_head(self):
+        return len(self._notes) > 1 or self._rec_opening
+
+    def _note_ready(self, note, text):
+        if note.pin is not None:
+            self._pin_ready(note, text)
+            return
+        if note not in self._notes:
+            return
+        note.text  = text
+        note.state = 'ready'
+        if note is not self._notes[0] or self._paused:
+            note.pill.queued(text)
+        self._advance()
+
+    def _note_failed(self, note, message, seconds, error=False):
+        if note.pin is not None:
+            self._pin_failed(note)
+        if note in self._notes:
+            self._notes.remove(note)
+        if error:
+            note.pill.failed(message, seconds)
+        else:
+            note.pill.flash(message, seconds)
+        self._advance()
+
+    def _note_gone(self, note):
+        """A note's pill left on its own. For a copied note that is the end
+        of it, unless a note got in line behind it while the pill was on its
+        way out: then it still owes a paste, so it comes back."""
+        if note in self._pinned and note.state == 'done':
+            self._pinned.remove(note)
+            return
+        if note not in self._notes:
+            return
+        if note.state == 'copied' and note.held and note is self._notes[0]:
+            note.pill = self._pill()
+            note.pill.on_gone = lambda n=note: self._note_gone(n)
+            note.pill.copied(note.text, None)
+            return
+        self._notes.remove(note)
+        self._advance()
+
+    def _note_pasted(self, note):
+        if note not in self._notes:
+            return
+        _debug_line('paste seen, next note up')
+        self._notes.remove(note)
+        if self._offer_note is note:
+            self._offer_note = None
+        note.pill.hide()
+        self._advance()
+
+    def _note_replaced(self, note):
+        """Something else went on the clipboard while note was waiting to be
+        pasted. Loading the next note now would throw away what was just
+        copied, so the queue stops here until Next Note."""
+        if note not in self._notes:
+            return
+        _debug_line('clipboard replaced, queue stopped')
+        self._notes.remove(note)
+        note.pill.hide()
+        self._paused = bool(self._notes)
+        self._advance()
+
+    def _advance(self):
+        """Give the clipboard to the oldest note once it is ready, unless
+        the queue has stopped."""
+        if not self._notes:
+            self._paused = False
+        head = self._notes[0] if self._notes else None
+        if head is not None and head.state == 'ready' and not self._paused:
+            head.state = 'copied'
+            head.held  = self._behind_head()
+            linger = None if head.held else COPIED_LINGER_SEC
+            if head.missed:
+                head.pill.pasted(head.text, 'not pinned, copied to clipboard',
+                                 linger)
+            else:
+                head.pill.copied(head.text, linger)
+            self._offer(head)
+        self._sync_head()
+        self._refresh_icon()
+
+    def _sync_head(self):
+        """Keep the copied note's pill up while anything is behind it, and
+        let it go the usual way once nothing is."""
+        head = self._notes[0] if self._notes else None
+        if head is not None and head.state == 'copied':
+            behind = self._behind_head()
+            if behind and not head.held:
+                head.held = True
+                head.pill.hold()
+            elif not behind and head.held:
+                head.held = False
+                head.pill.linger(COPIED_LINGER_SEC)
+        self._sync_next_item()
+
+    def _sync_next_item(self):
+        if self._next_item is None:
+            return
+        head = self._notes[0] if self._notes else None
+        can = head is not None and (head.state == 'copied' or self._paused)
+        self._next_item.set_callback(self._next_note if can else None)
+
+    def _next_note(self, _):
+        """Move the queue on by hand: skip the note on the clipboard, or
+        restart a queue that stopped because something else was copied."""
+        head = self._notes[0] if self._notes else None
+        if head is None:
+            return
+        if head.state == 'copied':
+            self._note_pasted(head)
+        elif self._paused:
+            self._paused = False
+            self._advance()
+
+    # ── Pinned notes ───────────────────────────────────────────────────────────
+    # A pin sends a note's transcript to a marker typed where it goes, and takes
+    # the note out of the clipboard queue for good. In a text field pin.py swaps
+    # the transcript in. Every pin is also written to PINS_DIR, which is how
+    # pin_hook.py hands Claude Code the transcript for a marker in a terminal.
+    # A note that is already transcribed gets no marker: it is typed at the
+    # cursor. In a terminal the marker is swapped by keystrokes when the screen
+    # can be read, and left for the hook when it cannot. A transcript that went
+    # nowhere goes back in the clipboard queue.
+
+    def _pin_target(self):
+        """The note a pin would take: the newest one whose transcript has
+        not been pasted or pinned yet. Main thread."""
+        for note in reversed(self._notes):
+            if note.state in ('recording', 'transcribing', 'ready', 'copied'):
+                return note
+        return None
+
+    def _retry_tap(self, timer):
+        if self._tap is not None and self._tap.start():
+            timer.stop()
+            _debug_line('click pin tap started')
+
+    def _pin_hotkey_fired(self):
+        note = self._pin_target()
+        if note is None:
+            self._hud_flash('No note to pin.')
+        elif not pin.trusted():
+            pin.trusted(prompt=True)
+            self._hud_flash('Accessibility is off for ClipBridge.')
+        else:
+            self._start_pin(note, None)
+
+    def _pin_click(self, x, y):
+        note = self._pin_target()
+        if note is not None:
+            self._start_pin(note, (x, y))
+
+    def _start_pin(self, note, at):
+        self._notes.remove(note)
+        self._pinned.append(note)
+        if self._offer_note is note:
+            self._offer_note = None
+        if note.state in ('ready', 'copied'):
+            # the words exist, so they go in where a marker would have
+            note.pin = pin.Pin(None)
+            note.pin.number = None
+            note.state = 'delivering'
+
+            def run():
+                ok = note.pin.type_now(note.text, at, _debug_line)
+                _on_main(self._pin_done, note, 'pasted' if ok else None)
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            number = _next_pin_number()
+            note.pin = pin.Pin(f'\u27e6note {number}\u27e7')
+            note.pin.number = number
+            _write_pin(number, 'pending')
+            threading.Thread(target=note.pin.place, args=(at, _debug_line),
+                             daemon=True).start()
+        self._advance()
+
+    def _pin_ready(self, note, text):
+        note.text  = text
+        note.state = 'delivering'
+        _write_pin(note.pin.number, 'ready', text)
+
+        def run():
+            number = note.pin.number
+            result = note.pin.deliver(text, log=_debug_line,
+                                      gone=lambda: _pin_sent(number))
+            _on_main(self._pin_done, note, result)
+        threading.Thread(target=run, daemon=True).start()
+        self._refresh_icon()
+
+    def _pin_done(self, note, result):
+        """result is 'pasted', 'hook' for a marker left in a terminal for
+        pin_hook.py, or None for a transcript that went nowhere."""
+        marker = note.pin.marker
+        if result != 'hook' and note.pin.number is not None:
+            _write_pin(note.pin.number, 'ready', note.text, waiting=False)
+        if result is None:
+            # back in line for the clipboard, behind whatever holds it now
+            if note in self._pinned:
+                self._pinned.remove(note)
+            note.pin    = None
+            note.missed = True
+            note.state  = 'ready'
+            self._notes.append(note)
+            if note is not self._notes[0] or self._paused:
+                note.pill.queued(note.text)
+            self._advance()
+            return
+        note.state = 'done'
+        if result == 'pasted':
+            note.pill.pasted(note.text)
+        else:
+            note.pill.pasted(note.text, f'ready for {marker}')
+        self._refresh_icon()
+
+    def _pin_failed(self, note):
+        """No transcript is coming. The pin file says so, and a marker in a
+        text field is taken back out."""
+        if note in self._pinned:
+            self._pinned.remove(note)
+
+        def run():
+            note.pin.placed.wait(5)
+            # in a terminal the marker may still be sent, and the hook should
+            # say the transcript is missing, so that pin stays waiting
+            _write_pin(note.pin.number, 'failed', waiting=note.pin.terminal)
+            if not note.pin.terminal:
+                note.pin.deliver('', _debug_line)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _offer(self, note):
+        """Put note on the clipboard as a promise rather than as text. macOS
+        asks this app for the text at the moment something pastes it, and
+        that request is how the queue learns of the paste, with no key
+        watched and no permission involved.
+
+        Watching the keyboard for Cmd+V was the first attempt and saw
+        nothing at all: without Input Monitoring, CGEventSourceKeyState
+        reads every key as up."""
+        if not HAS_APPKIT:
+            _copy(note.text)
+            _on_main(self._note_pasted, note)
+            return
+        promise = _ClipPromise.alloc().initWithOwner_note_(self, note)
+        item = NSPasteboardItem.alloc().init()
+        item.setDataProvider_forTypes_(promise, [NSPasteboardTypeString])
+        pb = NSPasteboard.generalPasteboard()
+        self._offer_note = None
+        pb.clearContents()
+        pb.writeObjects_([item])
+        # held here as well as by the pasteboard, so a provider can never be
+        # collected while the clipboard still names it
+        self._promises = (self._promises + [promise])[-8:]
+        self._offer_note  = note
+        self._offer_count = pb.changeCount()
+        if self._clip_timer is None:
+            self._clip_timer = rumps.Timer(self._on_clip_tick, CLIP_WATCH_SEC)
+            self._clip_timer.start()
+
+    def _on_clip_tick(self, _timer=None):
+        """Notice something else copied over the note on offer. The
+        pasteboard does not announce it: its notice to the old provider only
+        arrives the next time this app touches the pasteboard, so the change
+        counter is compared instead. That notice is also why the provider
+        implements nothing but the handover: asking the pasteboard anything
+        from inside it re-enters the pasteboard until Python's recursion
+        limit, as a test found."""
+        note = self._offer_note
+        if note is None:
+            self._stop_clip_timer()
+            return
+        try:
+            count = NSPasteboard.generalPasteboard().changeCount()
+        except Exception:
+            return
+        if count != self._offer_count:
+            self._offer_note = None
+            self._stop_clip_timer()
+            self._note_replaced(note)
+
+    def _stop_clip_timer(self):
+        if self._clip_timer is not None:
+            self._clip_timer.stop()
+            self._clip_timer = None
+
+    def _sweep_pending(self, pill=None):
         """One pass over the saved notes, oldest first. Stops at the first
         note that still fails, since that almost always means the worker or
         the network is down and the rest would fail the same way.
 
         Only one sweep runs at a time, and a note the live upload still has
         in hand is skipped, so a note can never be transcribed twice or land
-        on the clipboard twice."""
-        if not self._sweep_lock.acquire(blocking=False):
+        on the clipboard twice.
+
+        pill is given when Retry Pending was pressed. It is already showing
+        Transcribing, and it is where the outcome goes. A timed sweep has no
+        pill and says nothing unless a note came back. A pressed retry waits
+        for a timed sweep in progress rather than being dropped."""
+        if not self._sweep_lock.acquire(blocking=pill is not None):
             return 0
         try:
-            return self._sweep_once()
+            return self._sweep_once(pill)
         finally:
             self._sweep_lock.release()
 
-    def _sweep_once(self):
+    def _sweep_once(self, pill=None):
         _prune_pending()
         _prune_notes()
-        recovered = 0
+        recovered, last, error, heard_nothing = 0, None, None, 0
         for path in _list_pending():
-            if self._rec_on:
+            # a recovered note goes straight to the clipboard, so it waits
+            # until no note of this session is still in line for it
+            if self._rec_on or self._notes:
                 break
             with self._inflight_lock:
                 busy = str(path) in self._inflight
             if busy:
                 continue
             try:
-                audio, sr = sf.read(str(path), dtype='float32')
+                sf.info(str(path))
             except Exception:
                 _discard_pending(path)   # unreadable, retrying cannot help
                 continue
             try:
-                text = noteproc.transcribe_note(audio, sr, WORKER_URL)
-            except Exception:
+                text = _transcribe(path)
+            except Exception as e:
+                _debug_line(f'retry failed on {path.name}: {e}')
+                error = e
                 break
             _keep_note(path, text)
             _on_main(self._rebuild_notes_menu)
             if text:
                 recovered += 1
+                last = text
                 _copy(text)
-                _notify(text, title='Recovered voice note')
-        if recovered:
-            self._hud_flash(f'Recovered {recovered} saved note'
-                            f'{"s" if recovered > 1 else ""}')
+                if pill is None:
+                    _notify(text, title='Recovered voice note')
+            else:
+                heard_nothing += 1
+        if pill is None:
+            if recovered:
+                self._hud_flash(f'Recovered {recovered} saved note'
+                                f'{"s" if recovered > 1 else ""}')
+        elif error is not None:
+            if recovered:
+                pill.failed(f'Recovered {recovered}, then failed: {error}')
+            else:
+                pill.failed(str(error))
+        elif recovered == 1:
+            pill.copied(last)
+        elif recovered:
+            pill.flash(f'Recovered {recovered} saved notes')
+        elif heard_nothing:
+            pill.flash('Nothing heard.')
+        elif self._rec_on or self._notes:
+            pill.flash('Voice notes are still queued.')
+        else:
+            # a timed sweep got there while this one waited, and has
+            # already said so in a pill of its own
+            pill.hide()
         return recovered
 
     def _retry_loop(self):
@@ -1104,8 +1733,8 @@ class ClipBridge(rumps.App):
         while True:
             time.sleep(RETRY_FIRST_SEC if first else RETRY_SEC)
             first = False
-            if self._rec_on:
-                continue     # never compete with a recording in progress
+            if self._rec_on or self._notes:
+                continue     # never compete with notes in progress
             try:
                 self._sweep_pending()
             except Exception:
@@ -1167,6 +1796,13 @@ class ClipBridge(rumps.App):
         transcripts were saved, or one whose text never landed, has only the
         audio, so that is transcribed again and the text kept this time."""
         wav = Path(wav)
+        # the clipboard belongs to the queue while any note is in it
+        if self._rec_on or self._rec_opening:
+            self._hud_flash('Already recording.')
+            return
+        if self._notes:
+            self._hud_flash('Voice notes are still queued.')
+            return
         text = _read_note_text(wav)
         if text:
             _copy(text)
@@ -1176,31 +1812,38 @@ class ClipBridge(rumps.App):
             self._hud_flash('That note is gone.')
             _on_main(self._rebuild_notes_menu)
             return
-        if self._rec_on or self._rec_opening:
-            self._hud_flash('Already recording.')
-            return
-        self._set_state('busy')
-        if self._hud:
-            self._hud.processing()
-        threading.Thread(target=self._replay_worker, args=(wav,),
+        self._replaying = True
+        self._refresh_icon()
+        pill = self._pill()
+        pill.processing()
+        threading.Thread(target=self._replay_worker, args=(wav, pill),
                          daemon=True).start()
 
-    def _replay_worker(self, wav):
+    def _replay_worker(self, wav, pill):
         try:
-            audio, sr = sf.read(str(wav), dtype='float32')
-            text = noteproc.transcribe_note(audio, sr, WORKER_URL)
+            text = _transcribe(wav)
         except Exception as e:
-            self._set_state('idle')
-            self._hud_flash(str(e), seconds=3.0)
-            return
-        self._set_state('idle')
-        if text:
-            _write_note_text(wav, text)
-            _copy(text)
-            self._hud_copied(text)
-            _on_main(self._rebuild_notes_menu)
+            _debug_line(f'replay failed: {e}')
+            pill.failed(str(e))
         else:
-            self._hud_flash('Nothing heard.')
+            if text:
+                _write_note_text(wav, text)
+                _on_main(self._rebuild_notes_menu)
+            _on_main(self._replay_done, pill, text)
+        finally:
+            self._replaying = False
+            _on_main(self._refresh_icon)
+
+    def _replay_done(self, pill, text):
+        if not text:
+            pill.flash('Nothing heard.')
+        elif self._rec_on or self._notes:
+            # a note was started while this one transcribed, and the
+            # clipboard is its now
+            pill.flash('Transcript saved to Recent Notes.')
+        else:
+            _copy(text)
+            pill.copied(text)
 
     def _open_notes(self, _):
         try:
@@ -1210,7 +1853,22 @@ class ClipBridge(rumps.App):
         subprocess.run(['open', str(NOTES_DIR)])
 
     def _retry_now(self, _):
-        threading.Thread(target=self._sweep_pending, daemon=True).start()
+        if self._rec_on or self._rec_opening:
+            self._hud_flash('Already recording.')
+            return
+        if self._notes:
+            self._hud_flash('Voice notes are still queued.')
+            return
+        with self._inflight_lock:
+            waiting = [p for p in _list_pending()
+                       if str(p) not in self._inflight]
+        if not waiting:
+            self._hud_flash('No saved notes to retry.')
+            return
+        pill = self._pill()
+        pill.processing()
+        threading.Thread(target=self._sweep_pending, args=(pill,),
+                         daemon=True).start()
 
 
 if __name__ == '__main__':

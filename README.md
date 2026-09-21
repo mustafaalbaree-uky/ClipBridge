@@ -19,7 +19,7 @@ Every clipboard sync product wants an account, a subscription, or your data on s
 * **Instant receives.** Auto fetch polls quietly in the background. When a clip arrives it lands directly on your clipboard and you get a native notification telling you what it was and where it came from.
 * **Selective by design.** Nothing syncs until you press send. Your clipboard is not streamed anywhere; only the clips you choose to share ever leave the machine.
 * **iPhone too (optional).** A database trigger pings your phone through the free Bark app, and one tap runs an iOS Shortcut that pulls the clip onto your iPhone clipboard. Sending from the phone is a Shortcut as well.
-* **Voice notes (optional).** Point either client at a tiny Cloudflare Worker and a "Record Note" item appears. On the Mac a global hotkey (default ctrl+alt+space) toggles recording from anywhere: press it, speak, press it again, and the transcript is on your clipboard a moment later. Recording is written straight to disk as it happens, so a note survives a failed upload or a crash and is retried later. Long recordings are chopped at quiet moments and transcribed in parallel, so even a long note comes back fast. On Windows the transcript is also pushed to your other devices; on the Mac it stays local until you choose to send it. The Mac keeps the last five notes under "Recent Notes" in the menu, listed by day and time, and clicking one puts its transcript back on the clipboard.
+* **Voice notes (optional).** A "Record Note" item, with transcription on the Mac itself: whisper.cpp runs the same model the hosted worker does, so the text is identical and a poor connection cannot hold it up. Windows, and a Mac without whisper.cpp installed, point at a tiny Cloudflare Worker instead. On the Mac a global hotkey (default ctrl+alt+space) toggles recording from anywhere: press it, speak, press it again, and the transcript is on your clipboard a moment later. Notes can overlap: press it again while one is still transcribing and the next note starts, with its pill under the pointer and the older ones stacked beneath it. Transcripts reach the clipboard in the order they were recorded, and each one waits until you have pasted the one before it. Recording is written straight to disk as it happens, so a note survives a crash, or a transcription that fails, and is retried later. On the worker path, long recordings are chopped at quiet moments and uploaded in parallel, so even a long note comes back fast. On Windows the transcript is also pushed to your other devices; on the Mac it stays local until you choose to send it. The Mac keeps the last five notes under "Recent Notes" in the menu, listed by day and time, and clicking one puts its transcript back on the clipboard.
 
 ## How it works
 
@@ -93,13 +93,30 @@ Now "Send to iPhone" on the PC rings your phone, and one tap puts the text on yo
 
 ### 5. Voice notes (optional)
 
-Deploy [`worker/transcribe-worker.js`](worker/transcribe-worker.js) to Cloudflare Workers with a `GROQ_API_KEY` secret, put the worker URL in your config as `transcribe_worker_url`, and restart the clients. A "Record Note" item appears in both menus, and on the Mac the global hotkey works too.
+On the Mac, two things and no account:
 
-The audio pipeline (in [`shared/noteproc.py`](shared/noteproc.py)) splits anything over three minutes into pieces cut at the quietest nearby moment so words are never sliced, transcribes the pieces in parallel, and retries transient failures with backoff.
+```bash
+brew install whisper-cpp
+mkdir -p ~/.clipbridge/models
+curl -L -o ~/.clipbridge/models/ggml-large-v3-turbo.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+```
+
+Restart ClipBridge and "Record Note" appears, along with the global hotkey. Nothing is uploaded and nothing needs a network. `~/.cache/lecpipe/models` is checked as well, so a copy of the model already there is used rather than fetched twice.
+
+For Windows, or for a Mac where you would rather not keep 1.6 GB of weights, deploy [`worker/transcribe-worker.js`](worker/transcribe-worker.js) to Cloudflare Workers with a `GROQ_API_KEY` secret and put the worker URL in your config as `transcribe_worker_url`. The Mac uses it only when whisper.cpp or the model is missing.
+
+The two paths run the same model, `whisper-large-v3-turbo`, so they return the same text. What differs is everything around it. Local, on an M3 Pro, a three minute note comes back in about seven seconds and works on a plane. The text whisper has already produced is fed back to it as context for the next window, which is how it gets stuck repeating a sentence until the note ends, losing everything said under the repetition, so that context is capped (`MAX_CONTEXT` in `shared/localasr.py`) at enough for a sentence to cross a window boundary and not enough for a loop to sustain itself. Through the worker, [`shared/noteproc.py`](shared/noteproc.py) splits anything over a minute into pieces cut at the quietest nearby moment so words are never sliced, uploads the pieces in parallel, and retries transient failures with backoff.
 
 A finished note is kept as a pair in `~/.clipbridge/notes`: the audio it was spoken into and a `.txt` of the same name holding what came back. The Mac menu's "Recent Notes" submenu lists the five most recent by day and time, and clicking one copies its transcript. When the text is missing, which is the case for a note recorded before this existed and for one whose transcript never landed, the audio is transcribed again and the text is saved that time. Only five notes survive: filing a sixth deletes the oldest, audio and transcript together.
 
-Mac permissions: the first recording asks for microphone access, and that is the only permission involved. The hotkey registers through the system hotkey API (the one Spotlight uses), so it needs no Input Monitoring or Accessibility access and works in every app, Terminal included. While recording the menu bar icon turns into a red dot; while transcribing, an ellipsis.
+Mac permissions: the first recording asks for microphone access. The hotkey registers through the system hotkey API (the one Spotlight uses), so it needs no Input Monitoring access and works in every app, Terminal included. Pinning (below) needs Accessibility, and nothing else does.
+
+Pinning a note to a text field: after stopping a note, press the pin hotkey (default ctrl+alt+v, `pin_hotkey` in the config) in a text field, or control option click one. If the transcript already exists, it is typed at the cursor and that is all. If it is still transcribing, ClipBridge types a marker such as `⟦note 1⟧` at the cursor. Keep typing around it, or go elsewhere. When the transcript comes back it replaces the marker through the accessibility API, without bringing that app forward, the cursor goes back to where you were typing, and the pill reads "pasted". The pin takes the newest note not yet pasted. If the marker cannot be found or the field will not take the text, the note goes back in the clipboard queue and the pill reads "not pinned, copied to clipboard".
+
+Gecko browsers (Zen, Firefox and their forks) are handled differently on purpose. Their handler for the accessibility call that replaces selected text passes a length where an end offset belongs, so it deletes everything typed before the marker and then fails the insert. In those browsers the marker is selected through accessibility, the selection is read back, and the transcript is typed over it as keystrokes.
+
+In a terminal (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, WezTerm) the marker is swapped with keystrokes. When the transcript arrives and the terminal window is in front, ClipBridge reads the screen text and the cursor position, walks the cursor back to the marker with the left arrow, and checks on screen that the cursor sits right after the marker. Only then does it backspace the marker away, type the transcript, and walk the cursor forward again. This works in a shell and in Claude Code's input box, across wrapped lines. A terminal that does not report its text and cursor (or a window that stays in the background for 90 seconds) keeps the marker, the pill reads "ready for ⟦note 1⟧", and the hook below covers Claude Code. Every pin is written to `~/.clipbridge/pins/<number>.json`, and [`mac/pin_hook.py`](mac/pin_hook.py), registered as a Claude Code `UserPromptSubmit` hook, finds the markers in a sent prompt, waits up to 110 seconds for any still transcribing, and gives Claude each transcript as what its marker stands for. The prompt text is left as typed. `build.sh` signs the app with the Apple Development certificate when there is one, because an ad hoc signature changes on every build and macOS drops the Accessibility grant with it. While recording the menu bar icon turns into a red dot; while transcribing, an ellipsis.
 
 ## Configuration
 
@@ -110,12 +127,15 @@ Mac permissions: the first recording asks for microphone access, and that is the
 | `supabase_url` | yes | your Supabase project URL |
 | `supabase_anon_key` | yes | your Supabase anon key |
 | `poll_seconds` | no | auto fetch interval, default 3 |
-| `transcribe_worker_url` | no | enables Record Note on both clients |
+| `transcribe_worker_url` | no | enables Record Note on Windows, and on a Mac without whisper.cpp |
+| `whisper_cli_path` | no | Mac, a whisper.cpp binary somewhere other than the usual places |
+| `whisper_model_path` | no | Mac, a model file outside `~/.clipbridge/models` and `~/.cache/lecpipe/models` |
+| `whisper_vocabulary` | no | Mac, a sentence or two of names whisper cannot get from the audio (a product name, a person, an acronym), fed in as the initial prompt |
 | `record_hotkey` | no | Mac recording toggle, default `<ctrl>+<alt>+r` |
 
 ## Privacy
 
-Your clips live in your own Supabase project and nowhere else. A clip stops being readable fifteen minutes after it is written, the rolling buffer keeps only the 50 most recent, and nothing is sent anywhere until you press send.
+Voice notes recorded on the Mac never leave it: the audio is transcribed on the machine and only the text you choose to send goes anywhere. Your clips live in your own Supabase project and nowhere else. A clip stops being readable fifteen minutes after it is written, the rolling buffer keeps only the 50 most recent, and nothing is sent anywhere until you press send.
 
 ## License
 

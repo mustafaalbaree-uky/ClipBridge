@@ -3,5 +3,8 @@
     "supabase_anon_key": "YOUR-SUPABASE-ANON-KEY",
     "poll_seconds": 3,
     "transcribe_worker_url": "",
-    "record_hotkey": "<ctrl>+<alt>+r"
+    "whisper_vocabulary": "",
+    "record_hotkey": "<ctrl>+<alt>+r",
+    "pin_hotkey": "<ctrl>+<alt>+v",
+    "pin_send_hotkey": "<ctrl>+<alt>+return"
 }

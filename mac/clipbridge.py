@@ -46,6 +46,11 @@ be seen the marker stays, and pin_hook.py gives Claude Code the transcript
 when the prompt is sent. A pin that goes nowhere puts its note back in the
 clipboard queue.
 
+The send hotkey (default ctrl+alt+return) pins the same way and then presses
+Return once the transcript is in, so a prompt dictated into Claude Code or a
+chat box goes out on its own. In Terminal it reaches the tab it was pinned in
+through AppleScript, so the window can be behind others by then.
+
 Recording is done by AVAudioRecorder, which writes straight into
 ~/.clipbridge/pending/partial, so the audio is on disk while it is still
 being spoken rather than only after the fact, and moves up into
@@ -191,6 +196,7 @@ if localasr is not None:
 LOCAL_ASR    = localasr is not None and localasr.available()
 HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
 PIN_HOTKEY   = _cfg.get('pin_hotkey', '<ctrl>+<alt>+v')
+PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+return')
 SAMPLERATE   = 16000
 
 # Recordings waiting on a transcription that has not succeeded yet. Bounded
@@ -411,7 +417,7 @@ def _debug_line(msg):
 
 def _parse_hotkey(spec):
     """'<ctrl>+<alt>+r' -> (virtualKey, modifierMask), or None if the spec
-    is not understood. Letters, digits, and space are supported."""
+    is not understood. Letters, digits, space, and return are supported."""
     mods = {'<cmd>': _hk_const.cmdKey, '<ctrl>': _hk_const.controlKey,
             '<alt>': _hk_const.optionKey, '<opt>': _hk_const.optionKey,
             '<shift>': _hk_const.shiftKey}
@@ -423,6 +429,8 @@ def _parse_hotkey(spec):
             chosen.append(mods[tok])
         elif tok == 'space':
             key = _hk_const.kVK_Space
+        elif tok in ('return', 'enter'):
+            key = _hk_const.kVK_Return
         elif len(tok) == 1 and (tok.isalpha() or tok.isdigit()):
             key = getattr(_hk_const, f'kVK_ANSI_{tok.upper()}', None)
         else:
@@ -981,9 +989,11 @@ class ClipBridge(rumps.App):
                 import traceback
                 diag['register_error'] = traceback.format_exc()
         self._pin_handle = None
+        self._pin_send_handle = None
         diag['pin'] = 'off, pin.py did not import' if pin is None else \
                       'off, no accessibility bindings' if not pin.HAS_AX else \
-                      f'hotkey {PIN_HOTKEY}, control option click'
+                      f'hotkey {PIN_HOTKEY}, send {PIN_SEND_HOTKEY}, ' \
+                      f'control option click'
         if CAN_RECORD and HAS_HOTKEY and pin is not None and pin.HAS_AX:
             diag['accessibility'] = pin.trusted(prompt=True)
             try:
@@ -998,6 +1008,18 @@ class ClipBridge(rumps.App):
                     self._pin_handle = _fire_pin
             except Exception as e:
                 diag['pin_register_error'] = str(e)
+            try:
+                parsed = _parse_hotkey(PIN_SEND_HOTKEY)
+                if parsed:
+                    vk, mods = parsed
+
+                    @quickHotKey(virtualKey=vk, modifierMask=mods)
+                    def _fire_pin_send():
+                        _on_main(self._pin_hotkey_fired, True)
+
+                    self._pin_send_handle = _fire_pin_send
+            except Exception as e:
+                diag['pin_send_register_error'] = str(e)
             self._tap = pin.ClickTap(self._pin_target, self._pin_click)
             # the tap can only be made once Accessibility is granted, which
             # may happen after launch, so keep trying until it is
@@ -1487,7 +1509,8 @@ class ClipBridge(rumps.App):
     # A note that is already transcribed gets no marker: it is typed at the
     # cursor. In a terminal the marker is swapped by keystrokes when the screen
     # can be read, and left for the hook when it cannot. A transcript that went
-    # nowhere goes back in the clipboard queue.
+    # nowhere goes back in the clipboard queue. A pin from the send hotkey
+    # presses Return once its transcript is in.
 
     def _pin_target(self):
         """The note a pin would take: the newest one whose transcript has
@@ -1502,7 +1525,7 @@ class ClipBridge(rumps.App):
             timer.stop()
             _debug_line('click pin tap started')
 
-    def _pin_hotkey_fired(self):
+    def _pin_hotkey_fired(self, send=False):
         note = self._pin_target()
         if note is None:
             self._hud_flash('No note to pin.')
@@ -1510,31 +1533,31 @@ class ClipBridge(rumps.App):
             pin.trusted(prompt=True)
             self._hud_flash('Accessibility is off for ClipBridge.')
         else:
-            self._start_pin(note, None)
+            self._start_pin(note, None, send)
 
     def _pin_click(self, x, y):
         note = self._pin_target()
         if note is not None:
             self._start_pin(note, (x, y))
 
-    def _start_pin(self, note, at):
+    def _start_pin(self, note, at, send=False):
         self._notes.remove(note)
         self._pinned.append(note)
         if self._offer_note is note:
             self._offer_note = None
         if note.state in ('ready', 'copied'):
             # the words exist, so they go in where a marker would have
-            note.pin = pin.Pin(None)
+            note.pin = pin.Pin(None, send)
             note.pin.number = None
             note.state = 'delivering'
 
             def run():
-                ok = note.pin.type_now(note.text, at, _debug_line)
-                _on_main(self._pin_done, note, 'pasted' if ok else None)
+                result = note.pin.type_now(note.text, at, _debug_line)
+                _on_main(self._pin_done, note, result)
             threading.Thread(target=run, daemon=True).start()
         else:
             number = _next_pin_number()
-            note.pin = pin.Pin(f'\u27e6note {number}\u27e7')
+            note.pin = pin.Pin(f'\u27e6note {number}\u27e7', send)
             note.pin.number = number
             _write_pin(number, 'pending')
             threading.Thread(target=note.pin.place, args=(at, _debug_line),
@@ -1555,10 +1578,12 @@ class ClipBridge(rumps.App):
         self._refresh_icon()
 
     def _pin_done(self, note, result):
-        """result is 'pasted', 'hook' for a marker left in a terminal for
-        pin_hook.py, or None for a transcript that went nowhere."""
+        """result is one of those listed on pin.Pin: 'pasted', for a pin
+        that sends 'sent', 'pressed' or 'unsent', 'hook' or 'hook-sent' for a
+        marker left in a terminal for pin_hook.py, or None for a transcript
+        that went nowhere."""
         marker = note.pin.marker
-        if result != 'hook' and note.pin.number is not None:
+        if result not in ('hook', 'hook-sent') and note.pin.number is not None:
             _write_pin(note.pin.number, 'ready', note.text, waiting=False)
         if result is None:
             # back in line for the clipboard, behind whatever holds it now
@@ -1573,10 +1598,12 @@ class ClipBridge(rumps.App):
             self._advance()
             return
         note.state = 'done'
-        if result == 'pasted':
-            note.pill.pasted(note.text)
-        else:
-            note.pill.pasted(note.text, f'ready for {marker}')
+        captions = {'pasted': 'pasted', 'sent': 'sent',
+                    'pressed': 'pasted, Return pressed',
+                    'unsent': 'pasted, not sent',
+                    'hook-sent': f'sent with {marker}'}
+        note.pill.pasted(note.text,
+                         captions.get(result, f'ready for {marker}'))
         self._refresh_icon()
 
     def _pin_failed(self, note):

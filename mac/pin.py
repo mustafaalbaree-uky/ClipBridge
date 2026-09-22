@@ -32,9 +32,24 @@ In a terminal the marker is swapped by keystrokes: the cursor is walked back
 to the marker, checked against the screen text to be sitting right after it,
 and only then is the marker backspaced away and the transcript typed. When
 that cannot be checked the marker stays, and pin_hook.py covers Claude Code.
+
+A pin can also send: once the transcript is in, Return is pressed, and only
+after the transcript reads back in place. In Terminal.app that goes through
+the tab itself, found again by its tty: AppleScript's `do script` writes to a
+tab's input as if typed, with a Return after it, whether or not the window is
+in front, so the marker is swapped and the prompt sent while you are in some
+other app. What the tab shows is read back the same way, so nothing is typed
+until the marker is the last thing in Claude Code's input box, and the
+prompt is seen to leave the box afterwards, with Return pressed again while
+it has not. That takes Automation access to Terminal, asked for the first
+time a pin that sends is set there. In a text field Return is pressed
+when the field's app is in front and the field has focus, and otherwise
+posted to that app alone, and only while the field is still what has focus
+inside it.
 """
 
 import re
+import subprocess
 import threading
 import time
 
@@ -99,7 +114,33 @@ _TERM_MOVES     = 8
 # cursor means the marker is in the scrollback, not in what is being typed.
 _TERM_RULES     = '\u2500\u2501\u2502\u256d\u256e\u256f\u2570'
 
-_KEY_LEFT, _KEY_RIGHT, _KEY_BACKSPACE = 123, 124, 51
+# Where a pin that sends can reach a tab without it being in front.
+TERMINAL_APP = 'com.apple.Terminal'
+
+# How long a sent prompt is given to leave the input box before Return is
+# pressed again, and how many more Returns that comes to at most. Claude Code
+# can take a burst of text as a paste, and then the Return that came with it
+# is typed into the box as a new line.
+_SENT_CHECK_SEC = 1.5
+_EXTRA_RETURNS  = 2
+# How long a text field is given to let go of a sent transcript, as a chat
+# box does once it sends.
+_FIELD_SENT_SEC = 2.0
+# The most one burst typed into Claude Code carries. Near 800 characters it
+# is taken as a paste.
+_PIECE_BYTES    = 400
+# How often a Terminal tab is read while waiting for its input box to hold
+# still, how long one read may take, and how long the marker is waited for.
+# The box is hidden while Claude Code asks a question, and a read costs a few
+# milliseconds, so a tab can be waited on far longer than a window in front.
+_TAB_POLL_SEC   = 0.25
+_TAB_TIMEOUT    = 10
+_TAB_WAIT_SEC   = 600.0
+# The first Apple event to Terminal can wait on the Automation prompt.
+_TAB_ASK_SEC    = 90
+
+_KEY_LEFT, _KEY_RIGHT, _KEY_BACKSPACE, _KEY_RETURN = 123, 124, 51, 36
+_CTRL_E, _DEL = '\x05', '\x7f'
 
 
 def trusted(prompt=False):
@@ -210,10 +251,245 @@ def press(code, times=1):
         time.sleep(0.004)
 
 
+def post_to(pid, code):
+    """Press one key in the app with this pid alone, in front or not."""
+    src = Q.CGEventSourceCreate(Q.kCGEventSourceStatePrivate)
+    for down in (True, False):
+        ev = Q.CGEventCreateKeyboardEvent(src, code, down)
+        Q.CGEventSetFlags(ev, 0)
+        Q.CGEventSetIntegerValueField(ev, Q.kCGEventSourceUserData, _EVENT_TAG)
+        Q.CGEventPostToPid(pid, ev)
+        time.sleep(0.004)
+
+
 def flat(text):
     """Text safe to send as keystrokes: a typed newline would send a chat
     message or run a shell line, so each becomes a space."""
     return re.sub(r'\s*[\r\n]+\s*', ' ', text).strip()
+
+
+def _plain(text):
+    """flat, with any other control character made a space, for text
+    written to a terminal's input, where one would act as a key."""
+    return re.sub(r'[\x00-\x1f\x7f]+', ' ', flat(text)).strip()
+
+
+def _squash(s):
+    """s without any spacing, so text a terminal wrapped onto several lines
+    still matches the text it came from."""
+    return re.sub(r'[\s ⠀]+', '', s)
+
+
+def _tail(text):
+    """The end of text, as it is looked for in an input box."""
+    return _squash(text)[-24:]
+
+
+def _rule(line):
+    s = line.strip()
+    return len(s) >= 10 and set(s) == {'─'}
+
+
+def input_box(screen):
+    """(text, True) inside Claude Code's input box, the part of the screen
+    between the last two full width rules. Without those rules, (the
+    screen, False), for a shell, where the input is the end of the screen."""
+    return _split_screen(screen)[1:]
+
+
+def _split_screen(screen):
+    """(what is above the input box, the input box, whether it is Claude
+    Code's), as input_box."""
+    lines = screen.split('\n')
+    rules = [i for i, line in enumerate(lines) if _rule(line)]
+    if len(rules) >= 2:
+        return ('\n'.join(lines[:rules[-2]]),
+                '\n'.join(lines[rules[-2] + 1:rules[-1]]), True)
+    return '', screen, False
+
+
+def _pieces(text, limit=None):
+    """text cut after spaces into pieces of at most limit bytes."""
+    limit = limit or _PIECE_BYTES
+    pieces, cur = [], ''
+    for word in re.findall(r'\S*\s*', text):
+        if cur and len((cur + word).encode('utf-8')) > limit:
+            pieces.append(cur)
+            cur = ''
+        cur += word
+    return pieces + [cur] if cur or not pieces else pieces
+
+
+# ── Terminal.app tabs ─────────────────────────────────────────────────────────
+# A tab is found by its tty, which stays the same while the tab is open, so a
+# pin reaches the tab it was set in wherever that tab has gone since. Reads and
+# writes go through one compiled script run in this process, a few
+# milliseconds each; osascript takes a third of a second just to start.
+# NSAppleScript is only safe on the main thread, so calls are handed there.
+
+_TAB_SCRIPT = """
+on tab_screen(wanted)
+    tell application "Terminal"
+        with timeout of 5 seconds
+            set found to contents of (every tab of every window whose tty is wanted)
+        end timeout
+    end tell
+    repeat with i from 1 to count of found
+        if (count of item i of found) > 0 then return item 1 of item i of found
+    end repeat
+    return missing value
+end tab_screen
+
+on tab_send(wanted, txt)
+    tell application "Terminal"
+        with timeout of 5 seconds
+            set found to (every tab of every window whose tty is wanted)
+            repeat with i from 1 to count of found
+                if (count of item i of found) > 0 then
+                    do script txt in (item 1 of item i of found)
+                    return "sent"
+                end if
+            end repeat
+        end timeout
+    end tell
+    return missing value
+end tab_send
+"""
+_tab_script = None
+
+
+def _fourcc(code):
+    return int.from_bytes(code.encode('ascii'), 'big')
+
+
+def _on_main_wait(fn, timeout):
+    """fn() run on the main thread, or None when it did not finish in time."""
+    if threading.current_thread() is threading.main_thread():
+        return fn()
+    out, done = [None], threading.Event()
+
+    def run():
+        try:
+            out[0] = fn()
+        finally:
+            done.set()
+    AppHelper.callAfter(run)
+    return out[0] if done.wait(timeout) else None
+
+
+def _tab_call(handler, *args):
+    """The text a handler in _TAB_SCRIPT returns, or None. Main thread."""
+    global _tab_script
+    try:
+        from Foundation import NSAppleEventDescriptor, NSAppleScript
+        if _tab_script is None:
+            script = NSAppleScript.alloc().initWithSource_(_TAB_SCRIPT)
+            ok, _ = script.compileAndReturnError_(None)
+            if not ok:
+                return None
+            _tab_script = script
+        event = NSAppleEventDescriptor \
+            .appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID_(
+                _fourcc('ascr'), _fourcc('psbr'),
+                NSAppleEventDescriptor.currentProcessDescriptor(), -1, 0)
+        event.setParamDescriptor_forKeyword_(
+            NSAppleEventDescriptor.descriptorWithString_(handler),
+            _fourcc('snam'))
+        params = NSAppleEventDescriptor.listDescriptor()
+        for i, arg in enumerate(args, 1):
+            params.insertDescriptor_atIndex_(
+                NSAppleEventDescriptor.descriptorWithString_(arg), i)
+        event.setParamDescriptor_forKeyword_(params, _fourcc('----'))
+        result, _ = _tab_script.executeAppleEvent_error_(event, None)
+        return result.stringValue() if result is not None else None
+    except Exception:
+        return None
+
+
+class TerminalTab:
+    """One Terminal.app tab, read and typed into through AppleScript."""
+
+    def __init__(self, tty):
+        self.tty = tty
+
+    @classmethod
+    def front(cls):
+        """The tab in front in Terminal's front window, or None, which is
+        also what a refused Automation prompt comes to. Through osascript,
+        so that waiting on the prompt holds up this thread and not the
+        main one."""
+        try:
+            run = subprocess.run(
+                ['osascript', '-e', 'tell application "Terminal" to get tty '
+                 'of selected tab of front window'],
+                capture_output=True, text=True, encoding='utf-8',
+                timeout=_TAB_ASK_SEC)
+        except Exception:
+            return None
+        tty = run.stdout.strip() if run.returncode == 0 else ''
+        return cls(tty) if tty.startswith('/dev/') else None
+
+    def screen(self):
+        return _on_main_wait(lambda: _tab_call('tab_screen', self.tty),
+                             _TAB_TIMEOUT)
+
+    def send(self, text):
+        """Type text into the tab, followed by Return."""
+        return _on_main_wait(lambda: _tab_call('tab_send', self.tty, text),
+                             _TAB_TIMEOUT) == 'sent'
+
+
+def _sent_from_box(read, enter, looking_for, before):
+    """Whether Claude Code's input box let go of what was just sent, with
+    `before` the box as it read just before that Return. Sent is the box
+    redrawn without looking_for or a paste in it, or looking_for showing
+    above the box as a sent prompt. While the box still holds it, which is
+    a Return that became a new line, Return is pressed again. Return in an
+    empty box does nothing, so a press that was not needed does no harm.
+    Only for Claude Code: in a shell a second Return would go to whatever
+    the first one started, so there the answer is False straight away."""
+    before = _squash(before)
+    for attempt in range(_EXTRA_RETURNS + 1):
+        if attempt and not enter():
+            return False
+        deadline = time.time() + _SENT_CHECK_SEC
+        while time.time() < deadline:
+            time.sleep(0.15)
+            screen = read()
+            if screen is None:
+                return False
+            above, box, is_box = _split_screen(screen)
+            if not is_box:
+                return False
+            box = _squash(box)
+            if looking_for in box or '[Pastedtext' in box:
+                before = box
+                continue
+            if box != before or looking_for in _squash(above):
+                return True
+    return False
+
+
+def _bundle_of(pid):
+    """The bundle id of the app a process runs from, read from its
+    executable path. NSRunningApplication answers from a list NSWorkspace
+    keeps up to date on the main run loop, and can come back empty."""
+    try:
+        import ctypes
+        from Foundation import NSBundle
+        buf = ctypes.create_string_buffer(4096)
+        n = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidpath(
+            int(pid), buf, ctypes.c_uint32(len(buf)))
+        if n <= 0:
+            return None
+        path = buf.value.decode('utf-8', 'replace')
+        at = path.find('.app/')
+        if at < 0:
+            return None
+        bundle = NSBundle.bundleWithPath_(path[:at + 4])
+        return bundle.bundleIdentifier() if bundle is not None else None
+    except Exception:
+        return None
 
 
 def _front_pid():
@@ -237,15 +513,27 @@ def click(x, y):
 
 
 class Pin:
-    """Where one note's transcript goes."""
+    """Where one note's transcript goes, and whether Return follows it.
 
-    def __init__(self, marker):
+    deliver and type_now come back with 'pasted', or for a pin that sends,
+    'sent' once the prompt or chat box let go of the text, 'pressed' when
+    Return was pressed and that could not be seen, and 'unsent' when the
+    text went in and Return was not pressed. 'hook' is a marker left in a
+    terminal for pin_hook.py, 'hook-sent' a prompt sent with its marker
+    still in it, which pin_hook.py fills in, and None is a transcript that
+    went nowhere."""
+
+    def __init__(self, marker, send=False):
         self.marker  = marker
+        self.send    = send
         self.pid     = None
         self.app     = None
+        self.bundle  = None
         self.element = None
         self.terminal = False
         self.gecko    = False
+        # the Terminal.app tab a pin that sends goes back to
+        self.tab      = None
         # set once the marker has been typed, so a transcript that comes back
         # first waits for it rather than looking for a marker not there yet
         self.placed  = threading.Event()
@@ -265,12 +553,15 @@ class Pin:
                 found = self._find(_PLACE_WAIT_SEC)
                 if found is not None:
                     self.element = found
+            elif self.send and self.bundle == TERMINAL_APP:
+                self.tab = self._own_tab()
             if log:
                 value = _attr(self.element, 'AXValue') if self.element else None
                 log(f'pin {self.marker} in {self.app}: '
                     f'role={_attr(self.element, "AXRole") if self.element else None} '
                     f'marker_readable={isinstance(value, str) and self.marker in value} '
-                    f'terminal={self.terminal}')
+                    f'terminal={self.terminal} send={self.send} '
+                    f'tab={self.tab.tty if self.tab else None}')
         except Exception as e:
             if log:
                 log(f'pin {self.marker} failed to place: {e}')
@@ -282,26 +573,59 @@ class Pin:
             return
         running = NSRunningApplication \
             .runningApplicationWithProcessIdentifier_(self.pid)
-        bundle = running.bundleIdentifier() if running is not None else None
-        self.terminal = bundle in TERMINALS
-        self.gecko    = bundle in GECKO
+        self.bundle   = running.bundleIdentifier() if running is not None else None
+        if self.bundle is None:
+            self.bundle = _bundle_of(self.pid)
+        self.terminal = self.bundle in TERMINALS
+        self.gecko    = self.bundle in GECKO
+
+    def _own_tab(self):
+        """The Terminal tab in front, once its screen shows this marker, so
+        the tab is the one it was typed into. None without Automation
+        access, which the first call asks for."""
+        tab = TerminalTab.front()
+        if tab is None:
+            return None
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            screen = tab.screen()
+            if screen is not None and self.marker in screen:
+                return tab
+            time.sleep(0.2)
+        return None
 
     def type_now(self, text, at=None, log=None):
         """For a transcript that already exists: type it at the cursor, with
-        no marker. True once the keystrokes are sent. Off the main thread."""
+        no marker, and press Return after it for a pin that sends. One of
+        the results listed on the class, or None when nothing was typed.
+        Off the main thread."""
         try:
             if at is not None:
                 click(*at)
                 time.sleep(0.15)
             self.pid, self.app, self.element = _focused()
+            self._classify()
+            if self.send and self.bundle == TERMINAL_APP:
+                self.tab = TerminalTab.front()
+            if self.tab is not None:
+                screen = self.tab.screen()
+                is_box = screen is not None and input_box(screen)[1]
+                what, result = self._type_in_tab(_plain(text), 0, is_box)
+                if log:
+                    log(f'pin typed through {self.tab.tty}: {what} ({self.app})')
+                return result
             type_text(flat(text))
+            result = 'pasted'
+            if self.send:
+                result = self._return_in_terminal(text) if self.terminal \
+                    else self._return_in_field(self.element, text)
             if log:
-                log(f'pin typed at the cursor in {self.app}')
-            return True
+                log(f'pin typed at the cursor in {self.app}: {result}')
+            return result
         except Exception as e:
             if log:
                 log(f'pin failed to type: {e}')
-            return False
+            return None
         finally:
             self.placed.set()
 
@@ -359,9 +683,9 @@ class Pin:
         return walk(root, 0)
 
     def deliver(self, text, log=None, gone=None):
-        """Replace the marker with text. 'pasted' once the field reads back
-        with the marker gone and the text in, 'hook' for a marker left in a
-        terminal for pin_hook.py, None when it went nowhere. Runs off the
+        """Replace the marker with text, then press Return for a pin that
+        sends. 'pasted' once the field reads back with the marker gone and
+        the text in; the other results are listed on the class. Runs off the
         main thread.
 
         A field that could be taking keystrokes gets only its marker replaced.
@@ -372,11 +696,25 @@ class Pin:
         there is one attempt, never a second method after the first, since a
         slow one landing late would put the transcript in twice."""
         self.placed.wait(5)
+        sending = self.send and bool(text)
+        if self.tab is not None and sending:
+            what, result = self._send_in_tab(text, gone)
+            if log:
+                log(f'pin {self.marker} through {self.tab.tty}: {what} '
+                    f'({self.app})')
+            return result
         if self.terminal:
             outcome = self._in_terminal(text, gone)
             if log:
                 log(f'pin {self.marker} {outcome} ({self.app})')
-            return 'pasted' if outcome == 'delivered' else 'hook'
+            if outcome != 'delivered':
+                return 'hook'
+            if not sending:
+                return 'pasted'
+            result = self._return_in_terminal(text)
+            if log:
+                log(f'pin {self.marker} Return: {result}')
+            return result
         # the field's element can be rebuilt by a page redrawing it, so look
         # for the marker again rather than trusting the element from placing
         el = self.element if self._has_marker(self.element) else None
@@ -393,7 +731,14 @@ class Pin:
             outcome = self._by_value(el, text)
         if log:
             log(f'pin {self.marker} {outcome} ({self.app})')
-        return 'pasted' if outcome == 'delivered' else None
+        if outcome != 'delivered':
+            return None
+        if not sending:
+            return 'pasted'
+        result = self._return_in_field(el, text)
+        if log:
+            log(f'pin {self.marker} Return: {result}')
+        return result
 
     def _front_and_focused(self, el):
         return _front_pid() == self.pid and _attr(el, 'AXFocused') is not False
@@ -634,6 +979,190 @@ class Pin:
                 time.sleep(0.04)
                 return self._screen() or screen
         return screen
+
+    # ── Return ─────────────────────────────────────────────────────────────
+
+    def _return_in_field(self, el, text):
+        """Return in el once the transcript reads back in it and the field
+        has held still. In front it is a keystroke. Behind, it is posted to
+        the field's app alone, and only while the field is still what has
+        focus inside that app. 'sent' when the field then lets go of the
+        text, as a chat box does once it sends, 'pressed' when it keeps it,
+        as a search field does, 'unsent' when Return was not pressed."""
+        looking_for = _tail(flat(text))
+        value = _attr(el, 'AXValue') if el is not None else None
+        readable = isinstance(value, str)
+        if readable:
+            deadline = time.time() + _VERIFY_SEC
+            while looking_for not in _squash(value or ''):
+                if time.time() > deadline:
+                    return 'unsent'
+                time.sleep(0.05)
+                value = _attr(el, 'AXValue')
+            if not self._wait_quiet(el) or \
+                    looking_for not in _squash(_attr(el, 'AXValue') or ''):
+                return 'unsent'
+        if el is None:
+            # typed where nothing could be read, so Return follows the
+            # keystrokes into whatever is in front, if it is still this app
+            if _front_pid() != self.pid:
+                return 'unsent'
+            time.sleep(0.2)
+            press(_KEY_RETURN)
+            return 'pressed'
+        if self._front_and_focused(el):
+            press(_KEY_RETURN)
+        elif self.pid is not None and \
+                _attr(_wake_app(self.pid), 'AXFocusedUIElement') == el:
+            post_to(self.pid, _KEY_RETURN)
+        else:
+            return 'unsent'
+        if not readable:
+            return 'pressed'
+        deadline = time.time() + _FIELD_SENT_SEC
+        while time.time() < deadline:
+            time.sleep(0.1)
+            now = _attr(el, 'AXValue')
+            if isinstance(now, str) and looking_for not in _squash(now):
+                return 'sent'
+        return 'pressed'
+
+    def _return_in_terminal(self, text):
+        """Return by keystroke after the transcript went into a terminal in
+        front: once the screen shows it and has held still, and only while
+        the window is still in front with its text area focused."""
+        el = self.element
+        looking_for = _tail(flat(text))
+        read = lambda: _attr(el, 'AXValue') if el is not None else None
+        value, box = read(), ''
+        if isinstance(value, str):
+            deadline = time.time() + _VERIFY_SEC
+            last, since = None, time.time()
+            while True:
+                if time.time() > deadline:
+                    return 'unsent'
+                time.sleep(0.05)
+                value = read()
+                box = input_box(value)[0] if isinstance(value, str) else ''
+                if looking_for not in _squash(box):
+                    last = None
+                    continue
+                if box != last:
+                    last, since = box, time.time()
+                elif time.time() - since >= 0.3:
+                    break
+        if el is None or not self._front_and_focused(el):
+            return 'unsent'
+        press(_KEY_RETURN)
+        if not isinstance(value, str):
+            return 'pressed'
+
+        def enter():
+            if not self._front_and_focused(el):
+                return False
+            press(_KEY_RETURN)
+            return True
+        return 'sent' if _sent_from_box(read, enter, looking_for, box) \
+            else 'pressed'
+
+    # ── Through a Terminal.app tab ─────────────────────────────────────────
+
+    def _send_in_tab(self, text, gone=None):
+        """Swap the marker and send the prompt through the tab it was set in,
+        in front or not. The tab's cursor cannot be read this way, so nothing
+        is typed until the marker is the last thing in the input box and the
+        box has held still, which leaves the cursor right after it. Returns
+        (what happened, result)."""
+        text = _plain(text)
+        deadline = time.time() + _TAB_WAIT_SEC
+        last, since = None, time.time()
+        while True:
+            if gone is not None and gone():
+                return 'marker already sent', 'hook'
+            screen = self.tab.screen()
+            if screen is None:
+                return 'tab closed or unreadable', 'hook'
+            box, is_box = input_box(screen)
+            if box != last:
+                last, since = box, time.time()
+            elif self.marker in box and time.time() - since >= _QUIET_SEC:
+                break
+            if time.time() > deadline:
+                return 'the input box never held the marker still', 'hook'
+            time.sleep(_TAB_POLL_SEC)
+        after = box[box.rfind(self.marker) + len(self.marker):]
+        if not after.strip():
+            what, result = self._type_in_tab(text, len(self.marker), is_box)
+            return what, result or 'hook'
+        if not is_box:
+            return 'text after the marker, left for the hook', 'hook'
+        # text typed after the marker could have the cursor anywhere in it,
+        # so the marker stays, and pin_hook.py fills it in once this is sent
+        if not self.tab.send(''):
+            return 'Terminal did not take Return', 'hook'
+        if _sent_from_box(self.tab.screen, lambda: self.tab.send(''),
+                          _squash(self.marker), box):
+            return 'sent with the marker in it, for the hook', 'hook-sent'
+        return 'Return pressed with the marker in it, not confirmed', 'hook'
+
+    def _type_in_tab(self, text, erase, is_box):
+        """Type text into the tab, taking `erase` characters off before the
+        cursor first, and press Return. Returns (what happened, result),
+        with None for a result when nothing was typed.
+
+        Claude Code takes one burst of about 800 characters or more as a
+        paste: it hands that to Claude as pasted content rather than as
+        your words, loses what follows a backspace in the same burst, and
+        turns the Return after it into a new line. So a long transcript goes
+        into Claude Code's input box in pieces. Each piece but the last ends
+        in a backslash, which with the Return that follows makes a new line
+        rather than sending, and the next piece starts by deleting that new
+        line. A short burst loses the backslash to the new line, and a burst
+        of a few hundred characters keeps it, so what the box shows decides
+        whether the backslash is deleted too. In a shell a backslash would
+        carry the command on to the next line, so there it is one burst."""
+        pieces = _pieces(text) if is_box else [text]
+        head = (_CTRL_E + _DEL * erase) if erase else ''
+        typed = ''
+        before = ''
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            if last:
+                before = input_box(self.tab.screen() or '')[0]
+            if not self.tab.send(head + piece + ('' if last else '\\')):
+                if i == 0:
+                    return 'Terminal did not take the text', None
+                return f'Terminal stopped taking text after piece {i}', 'unsent'
+            typed += piece
+            if last:
+                break
+            box = self._box_shows(_tail(typed))
+            if box is None:
+                return f'piece {i + 1} of {len(pieces)} never showed', 'unsent'
+            head = _DEL * (2 if box.endswith('\\') else 1)
+        if not is_box:
+            return 'typed with Return', 'pressed'
+        if _sent_from_box(self.tab.screen, lambda: self.tab.send(''),
+                          _tail(text), before):
+            return f'sent in {len(pieces)} piece(s)', 'sent'
+        return 'Return pressed, prompt still in the input box', 'pressed'
+
+    def _box_shows(self, looking_for, wait_sec=3.0):
+        """The input box, squashed, once it shows looking_for and has held
+        still, or None."""
+        deadline = time.time() + wait_sec
+        last = None
+        while time.time() < deadline:
+            time.sleep(0.05)
+            screen = self.tab.screen()
+            box = _squash(input_box(screen)[0]) if screen is not None else ''
+            if looking_for not in box:
+                last = None
+            elif box == last:
+                return box
+            else:
+                last = box
+        return None
 
 
 def focused_is(el):

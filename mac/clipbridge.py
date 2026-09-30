@@ -46,7 +46,7 @@ be seen the marker stays, and pin_hook.py gives Claude Code the transcript
 when the prompt is sent. A pin that goes nowhere puts its note back in the
 clipboard queue.
 
-The send hotkey (default ctrl+alt+return) pins the same way and then presses
+The send hotkey (default ctrl+alt+c) pins the same way and then presses
 Return once the transcript is in, so a prompt dictated into Claude Code or a
 chat box goes out on its own. In Terminal it reaches the tab it was pinned in
 through AppleScript, so the window can be behind others by then.
@@ -196,7 +196,7 @@ if localasr is not None:
 LOCAL_ASR    = localasr is not None and localasr.available()
 HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
 PIN_HOTKEY   = _cfg.get('pin_hotkey', '<ctrl>+<alt>+v')
-PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+return')
+PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+c')
 SAMPLERATE   = 16000
 
 # Recordings waiting on a transcription that has not succeeded yet. Bounded

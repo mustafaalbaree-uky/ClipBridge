@@ -30,8 +30,11 @@ the insert. There the marker is selected and the transcript typed over it.
 
 In a terminal the marker is swapped by keystrokes: the cursor is walked back
 to the marker, checked against the screen text to be sitting right after it,
-and only then is the marker backspaced away and the transcript typed. When
-that cannot be checked the marker stays, and pin_hook.py covers Claude Code.
+and only then is the marker backspaced away and the transcript typed. Ghostty
+reports its screen but not its cursor, so there the marker has to be the last
+thing in the input box and hold still, and Control E puts the cursor after
+it. When that cannot be checked the marker stays, and pin_hook.py covers
+Claude Code.
 
 A pin can also send: once the transcript is in, Return is pressed, and only
 after the transcript reads back in place. In Terminal.app that goes through
@@ -140,6 +143,7 @@ _TAB_WAIT_SEC   = 600.0
 _TAB_ASK_SEC    = 90
 
 _KEY_LEFT, _KEY_RIGHT, _KEY_BACKSPACE, _KEY_RETURN = 123, 124, 51, 36
+_KEY_E = 14
 _CTRL_E, _DEL = '\x05', '\x7f'
 
 
@@ -240,13 +244,13 @@ def type_text(text):
         time.sleep(0.01)
 
 
-def press(code, times=1):
-    """Press one key, with no modifiers, times over."""
+def press(code, times=1, flags=0):
+    """Press one key, with no modifiers but flags, times over."""
     src = Q.CGEventSourceCreate(Q.kCGEventSourceStatePrivate)
     for _ in range(times):
         for down in (True, False):
             ev = Q.CGEventCreateKeyboardEvent(src, code, down)
-            Q.CGEventSetFlags(ev, 0)
+            Q.CGEventSetFlags(ev, flags)
             _post(ev)
         time.sleep(0.004)
 
@@ -922,16 +926,25 @@ class Pin:
                 last = None
                 continue
             value, cursor = screen
-            at = self._marker_before(value, cursor)
-            if at < 0:
+            # Ghostty reports its screen but not its cursor, which always
+            # reads as 0. There the marker has to be the last thing in the
+            # input box, as in a Terminal.app tab.
+            no_cursor = cursor == 0
+            if no_cursor:
+                typing = self._marker_ends_box(value)
+            else:
+                at = self._marker_before(value, cursor)
+                typing = value[at:cursor] if at >= 0 else None
+            if typing is None:
                 last = None
                 continue
             # what is being typed has to hold still, as in a text field
-            typing = value[at:cursor]
             if typing != last:
                 last, since = typing, time.time()
             elif time.time() - since >= _QUIET_SEC:
                 break
+        if no_cursor:
+            return self._swap_at_end(text)
         end = at + len(self.marker)
         origin, moved = cursor, 0
         for _ in range(_TERM_MOVES):
@@ -966,6 +979,26 @@ class Pin:
         press(_KEY_BACKSPACE, len(self.marker))
         type_text(text)
         press(_KEY_RIGHT, max(0, moved))
+        return 'delivered'
+
+    def _marker_ends_box(self, value):
+        """The input box when the marker is the last thing in it, or None."""
+        box = input_box(value)[0]
+        at = box.rfind(self.marker)
+        if at < 0 or _squash(box[at + len(self.marker):]):
+            return None
+        return box
+
+    def _swap_at_end(self, text):
+        """Swap a marker that ends the input box, for a terminal that does
+        not report its cursor. Control E puts the cursor at the end of the
+        line first, as it does in Claude Code and in a shell."""
+        if not self._front_and_focused(self.element):
+            return 'left for the hook: window left the front before the swap'
+        press(_KEY_E, flags=Q.kCGEventFlagMaskControl)
+        time.sleep(0.05)
+        press(_KEY_BACKSPACE, len(self.marker))
+        type_text(text)
         return 'delivered'
 
     def _settled(self, was):

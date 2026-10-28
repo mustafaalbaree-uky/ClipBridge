@@ -11,8 +11,8 @@ OPTIONS = {
     'packages': ['rumps', 'requests', 'certifi', 'urllib3', 'idna',
                  'charset_normalizer', 'numpy', 'soundfile',
                  '_soundfile_data', 'quickmachotkey', 'AVFoundation',
-                 'ApplicationServices', 'Quartz'],
-    'includes': ['noteproc', 'localasr', 'hud', 'loginitem', 'pin'],
+                 'ApplicationServices', 'Quartz', 'cryptography', 'cffi'],
+    'includes': ['noteproc', 'localasr', 'hud', 'loginitem', 'pin', 'cbcrypt'],
     'plist': {
         'LSUIElement': True,
         'CFBundleName': 'ClipBridge',

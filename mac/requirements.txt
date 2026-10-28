@@ -5,3 +5,6 @@ numpy
 pyobjc-framework-AVFoundation
 soundfile
 quickmachotkey
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Quartz
+cryptography

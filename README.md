@@ -140,8 +140,11 @@ In Terminal this does not use keystrokes. ClipBridge notes the tab's tty when yo
 | `record_hotkey` | no | Mac recording toggle, default `<ctrl>+<alt>+r` |
 | `pin_hotkey` | no | Mac, pin the newest note to the focused text field, default `<ctrl>+<alt>+v` |
 | `pin_send_hotkey` | no | Mac, pin the newest note and press Return once it is in, default `<ctrl>+<alt>+c` |
+| `encrypt_to_pc` | no | Mac, encrypt clips sent to the PC, default false until the Windows tray can decrypt them |
 
 ## Privacy
+
+Clips are encrypted on the device before they reach Supabase, in the `cb1` format described in [`shared/cbcrypt.py`](shared/cbcrypt.py): AES-256-GCM under a key made from a five word passphrase, with the clip's source sealed in and a timestamp that refuses replays. The anon key is published wherever the QR Bridge page is, so the table is treated as open to anyone; a clip that does not decrypt with your passphrase is dropped, which is also what stops anyone pushing text onto your clipboard. On the Mac, `python3 mac/tools/new_passphrase.py` makes the passphrase and stores it in the login Keychain (service `ClipBridge`, account `passphrase`); type the same words into the Windows tray and the QR Bridge page. `qr-bridge/test/cb1_compat.mjs` checks that the page and this module still agree.
 
 Voice notes recorded on the Mac never leave it: the audio is transcribed on the machine and only the text you choose to send goes anywhere. Your clips live in your own Supabase project and nowhere else. A clip stops being readable fifteen minutes after it is written, the rolling buffer keeps only the 50 most recent, and nothing is sent anywhere until you press send.
 

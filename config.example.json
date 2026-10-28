@@ -6,5 +6,6 @@
     "whisper_vocabulary": "",
     "record_hotkey": "<ctrl>+<alt>+r",
     "pin_hotkey": "<ctrl>+<alt>+v",
-    "pin_send_hotkey": "<ctrl>+<alt>+c"
+    "pin_send_hotkey": "<ctrl>+<alt>+c",
+    "encrypt_to_pc": false
 }

@@ -2,7 +2,10 @@
 ClipBridge, Mac menu bar client.
 
 Polls the shared Supabase table for clips addressed to this Mac, copies
-them to the clipboard, and shows a notification. Sending is instant:
+them to the clipboard, and shows a notification. Clips are encrypted
+(shared/cbcrypt.py) with a key made from the passphrase in the login
+Keychain, and anything that does not decrypt with it is ignored, since the
+table itself is open to anyone holding the published anon key. Sending is instant:
 whatever is on the clipboard right now goes out, no dialog.
 
 Left click on the menu bar icon: send the clipboard to the PC.
@@ -143,6 +146,9 @@ try:
 except Exception:
     localasr = None
 
+# Not optional: without it nothing arriving can be told apart from a forgery.
+import cbcrypt
+
 try:
     from hud import RecordingHUD, PillStack
 except Exception:
@@ -198,6 +204,26 @@ HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
 PIN_HOTKEY   = _cfg.get('pin_hotkey', '<ctrl>+<alt>+v')
 PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+c')
 SAMPLERATE   = 16000
+# Clips to the PC stay plaintext until the Windows tray can decrypt them.
+ENCRYPT_TO_PC = bool(_cfg.get('encrypt_to_pc', False))
+
+
+def _load_key():
+    """The clip key, from the passphrase stored in the login Keychain
+    (service ClipBridge, account passphrase), or None when there is none."""
+    try:
+        out = subprocess.run(['security', 'find-generic-password', '-s',
+                              'ClipBridge', '-a', 'passphrase', '-w'],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    phrase = out.stdout.strip()
+    if out.returncode != 0 or not phrase:
+        return None
+    return cbcrypt.derive_key(phrase)
+
+
+CLIP_KEY = _load_key()
 
 # Recordings waiting on a transcription that has not succeeded yet. Bounded
 # so a worker that stays down cannot quietly fill the disk.
@@ -333,6 +359,10 @@ _REC_PATH  = _render_record_dot()
 def _fetch():
     """Latest clip addressed to this Mac. Returns (ok, id, content).
 
+    `content` is the decrypted text, or None when the row does not decrypt
+    with our key: a forgery, a plaintext clip, or a stale replay. The id is
+    still returned so the caller can mark the row seen and move on.
+
     `ok` says the database answered. An empty table is an answer, so it
     comes back as (True, None, None), while a failed request comes back as
     (False, None, None). The poll loop has to tell those two apart: it
@@ -343,9 +373,10 @@ def _fetch():
         res = requests.get(
             f'{SUPA_URL}/rest/v1/clips',
             headers=SUPA_HEADERS,
-            params={'select': 'id,content',
-                    # 'pc-to-mac' is the desktop app's directed label; the
-                    # QR-Bridge web page tags everything it pushes 'pc'.
+            params={'select': 'id,content,source',
+                    # 'pc-to-mac' is what the QR-Bridge page and the Windows
+                    # tray send here; 'pc' is kept for page versions still
+                    # cached from before the page tagged its clips that way.
                     'or': '(source.eq.pc-to-mac,source.eq.pc)',
                     'order': 'created_at.desc', 'limit': '1'},
             timeout=10,
@@ -354,13 +385,20 @@ def _fetch():
             return False, None, None
         rows = res.json()
         if rows:
-            return True, rows[0]['id'], rows[0]['content']
+            row = rows[0]
+            text = (cbcrypt.decrypt(CLIP_KEY, row['content'], row.get('source'))
+                    if CLIP_KEY else None)
+            return True, row['id'], text
         return True, None, None
     except Exception:
         return False, None, None
 
 
 def _push(content):
+    if ENCRYPT_TO_PC:
+        if not CLIP_KEY:
+            return False
+        content = cbcrypt.encrypt(CLIP_KEY, content, 'mac-to-pc')
     try:
         expires_at = time.strftime('%Y-%m-%dT%H:%M:%SZ',
                                    time.gmtime(time.time() + 24 * 3600))
@@ -1098,6 +1136,9 @@ class ClipBridge(rumps.App):
         # next clip to arrive was taken as the seed and silently dropped.
         # Rows are held for fifteen minutes, so an empty table is the normal
         # state and that dropped clip was very nearly every clip.
+        if CLIP_KEY is None:
+            _notify('No passphrase in Keychain. Incoming clips are ignored.',
+                    title='ClipBridge')
         while not self._seeded:
             ok, row_id, _ = _fetch()
             if ok:
@@ -1110,10 +1151,11 @@ class ClipBridge(rumps.App):
             try:
                 if self._auto:
                     ok, row_id, content = _fetch()
-                    if ok and content and row_id != self._last_id:
+                    if ok and row_id != self._last_id:
                         self._last_id = row_id
-                        _copy(content)
-                        _notify(content)
+                        if content:
+                            _copy(content)
+                            _notify(content)
             except Exception:
                 pass
             time.sleep(POLL_SEC)

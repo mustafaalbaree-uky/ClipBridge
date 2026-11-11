@@ -182,16 +182,14 @@ def _load_config():
     return None
 
 
-_cfg = _load_config()
-if not _cfg or 'supabase_url' not in _cfg or 'supabase_anon_key' not in _cfg:
-    subprocess.run(['osascript', '-e',
-        'display alert "ClipBridge" message "No config found. Copy '
-        'config.example.json to ~/.clipbridge/config.json and fill in '
-        'your Supabase URL and anon key."'])
-    raise SystemExit(1)
+_cfg = _load_config() or {}
 
-SUPA_URL     = _cfg['supabase_url'].rstrip('/')
-SUPA_ANON    = _cfg['supabase_anon_key']
+# Sync needs a Supabase project. Without one (no config at all, or the
+# placeholders from config.example.json left in) the app runs as voice notes
+# only: no polling, no send items, and a left click opens the menu.
+SUPA_URL     = str(_cfg.get('supabase_url') or '').rstrip('/')
+SUPA_ANON    = str(_cfg.get('supabase_anon_key') or '')
+SYNC         = bool(SUPA_URL and SUPA_ANON) and 'YOUR-' not in SUPA_URL + SUPA_ANON
 SUPA_HEADERS = {'apikey': SUPA_ANON, 'Authorization': f'Bearer {SUPA_ANON}'}
 POLL_SEC     = int(_cfg.get('poll_seconds', 3))
 WORKER_URL   = _cfg.get('transcribe_worker_url', '')
@@ -276,6 +274,14 @@ CLIP_WATCH_SEC    = 0.5
 # whisper.cpp does its own windowing and needs nothing but the file.
 CAN_RECORD = HAS_AUDIO and (
     LOCAL_ASR or (bool(WORKER_URL) and noteproc is not None))
+
+if not SYNC and not CAN_RECORD:
+    subprocess.run(['osascript', '-e',
+        'display alert "ClipBridge" message "Nothing to run. Sync needs a '
+        'Supabase URL and anon key in ~/.clipbridge/config.json. Voice notes '
+        'need whisper.cpp (brew install whisper-cpp) and the model in '
+        '~/.clipbridge/models."'])
+    raise SystemExit(1)
 
 
 def _transcribe(path):
@@ -918,7 +924,7 @@ class ClipBridge(rumps.App):
         items = [
             rumps.MenuItem('Send to PC', callback=self._send_to_pc),
             rumps.MenuItem('Fetch Now',  callback=self._fetch_now),
-        ]
+        ] if SYNC else []
         if CAN_RECORD:
             self._record_item = rumps.MenuItem('Record Note',
                                                callback=self._toggle_record)
@@ -928,7 +934,8 @@ class ClipBridge(rumps.App):
             # what the submenu currently shows, so it is only rebuilt when the
             # notes on disk have actually changed
             self._notes_shown = None
-            items += [None, self._record_item, self._next_item, self._notes_item,
+            items += [None] if items else []
+            items += [self._record_item, self._next_item, self._notes_item,
                       rumps.MenuItem('Notes Folder',
                                      callback=self._open_notes),
                       rumps.MenuItem('Retry Pending',
@@ -937,9 +944,9 @@ class ClipBridge(rumps.App):
             self._next_item   = None
             self._notes_item  = None
             self._notes_shown = None
+        items += [None, self._auto_item] if SYNC else []
         items += [
             None,
-            self._auto_item,
             self._login_item,
             None,
             rumps.MenuItem('Quit', callback=lambda _: rumps.quit_application()),
@@ -987,7 +994,8 @@ class ClipBridge(rumps.App):
             except Exception as e:
                 self._pills = None
                 hud_note = f'off, {e}'
-        threading.Thread(target=self._poll, daemon=True).start()
+        if SYNC:
+            threading.Thread(target=self._poll, daemon=True).start()
         if CAN_RECORD:
             _recover_part_files()
             _prune_notes()
@@ -1003,7 +1011,7 @@ class ClipBridge(rumps.App):
         self._sync_login_item()
         diag = {
             'started': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'can_record': CAN_RECORD, 'has_audio': HAS_AUDIO,
+            'can_record': CAN_RECORD, 'has_audio': HAS_AUDIO, 'sync': SYNC,
             'has_hotkey_lib': HAS_HOTKEY, 'hotkey': HOTKEY,
             'hud': hud_note, 'login_item': login_state,
             'paste_signal': 'clipboard promise' if HAS_APPKIT else 'off, no AppKit',
@@ -1107,7 +1115,7 @@ class ClipBridge(rumps.App):
                     is_right = True
         except Exception:
             is_right = True
-        if is_right:
+        if is_right or not SYNC:
             self._pop_menu()
         else:
             self._send_to_pc(None)

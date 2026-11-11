@@ -47,6 +47,21 @@ Both desktop clients fix a cursor from the table before they start polling, so l
 
 ## Setup
 
+### Voice notes only (Mac, no accounts)
+
+ClipBridge also works as a dictation tool on its own: press a hotkey, speak, press it again, and the transcript is on your clipboard. That needs no Supabase project and no config file. Clone the repo, then:
+
+```bash
+brew install whisper-cpp python@3.13
+mkdir -p ~/.clipbridge/models
+curl -L -o ~/.clipbridge/models/ggml-large-v3-turbo.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+cd mac && ./build.sh --install
+```
+
+With no Supabase URL and key in the config, the menu has only the voice note items and a left click on the icon opens it. Everything below about the backend, Windows and the iPhone can be skipped. The hotkeys and settings are under [5. Voice notes](#5-voice-notes-optional).
+
+
 ### 1. The backend (five minutes, free)
 
 1. Create a project at [supabase.com](https://supabase.com).
@@ -130,14 +145,14 @@ In Terminal this does not use keystrokes. ClipBridge notes the tab's tty when yo
 
 | Key | Required | Meaning |
 |---|---|---|
-| `supabase_url` | yes | your Supabase project URL |
-| `supabase_anon_key` | yes | your Supabase anon key |
+| `supabase_url` | for sync | your Supabase project URL |
+| `supabase_anon_key` | for sync | your Supabase anon key |
 | `poll_seconds` | no | auto fetch interval, default 3 |
 | `transcribe_worker_url` | no | enables Record Note on Windows, and on a Mac without whisper.cpp |
 | `whisper_cli_path` | no | Mac, a whisper.cpp binary somewhere other than the usual places |
 | `whisper_model_path` | no | Mac, a model file outside `~/.clipbridge/models` and `~/.cache/lecpipe/models` |
 | `whisper_vocabulary` | no | Mac, a sentence or two of names whisper cannot get from the audio (a product name, a person, an acronym), fed in as the initial prompt |
-| `record_hotkey` | no | Mac recording toggle, default `<ctrl>+<alt>+r` |
+| `record_hotkey` | no | Mac recording toggle, default `<ctrl>+<alt>+space` |
 | `pin_hotkey` | no | Mac, pin the newest note to the focused text field, default `<ctrl>+<alt>+v` |
 | `pin_send_hotkey` | no | Mac, pin the newest note and press Return once it is in, default `<ctrl>+<alt>+c` |
 | `encrypt_to_pc` | no | Mac, encrypt clips sent to the PC, default false until the Windows tray can decrypt them |

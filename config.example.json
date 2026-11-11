@@ -4,7 +4,7 @@
     "poll_seconds": 3,
     "transcribe_worker_url": "",
     "whisper_vocabulary": "",
-    "record_hotkey": "<ctrl>+<alt>+r",
+    "record_hotkey": "<ctrl>+<alt>+space",
     "pin_hotkey": "<ctrl>+<alt>+v",
     "pin_send_hotkey": "<ctrl>+<alt>+c",
     "encrypt_to_pc": false

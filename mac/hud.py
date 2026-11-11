@@ -6,12 +6,16 @@ drifts slowly while recording (with a live elapsed counter), speeds up
 while transcribing, and flashes short confirmations. It replaces the
 notification banners for the whole voice note flow.
 
-The colours come from the desktop it sits on rather than from nowhere:
-the ground is a real backdrop blur under a slate wash, the same thing
-every widget on that screen is, and the ring runs from deep water through
-the shallows to the pale blue of the menu bar and back. The ring keeps
-moving because its speed is how the pill says whether it is listening or
-working. See the palette block below for what each value is taken from.
+The colours come from the desktop it sits on rather than from nowhere,
+and that desktop moves: the ground is a real backdrop blur under a wash,
+the same thing every widget on that screen is, and the ring runs through
+the water and the sky of whatever hour it is. Midday is deep water rising
+to the pale blue of the menu bar, sunset is the ember in the ridges and
+the amber over them, night is indigo under moonlight. It reads the sun
+for that rather than the clock, so it stays with a dynamic wallpaper
+through the year instead of calling seven in the evening golden in
+December. The ring keeps moving because its speed is how the pill says
+whether it is listening or working. See the palette block below.
 
 When a note lands on the clipboard the pill opens into two lines: a
 quiet "copied to clipboard" caption over the first few words of what
@@ -47,6 +51,15 @@ looking at, putting it back with its level and collection behavior when
 it is not. Every state entry writes a line to ~/.clipbridge/mac_debug.log
 if it throws, so a broken pill can never be invisible in the log too.
 
+Several pills can be up at once. PillStack keeps them in a column under
+the pointer, newest on top, so starting a note while an older one is
+still transcribing pushes the older pill down rather than replacing it.
+The pills slide to their new places instead of jumping, and the column
+flips above the pointer as a whole when there is no room for it below.
+Each pill is still its own panel. Panels are never thrown away, only
+returned to the stack's pool and reused, because an NSPanel cannot be
+disposed of cleanly from PyObjC (see HUD_DEBUGGING.md).
+
 When the pill goes missing anyway, mac/HUD_DEBUGGING.md is the runbook:
 why this failure recurs, what each shape of it looks like from the window
 server, and the two tools in mac/tools that tell them apart. Read it
@@ -57,8 +70,11 @@ Every public method is safe to call from any thread; work is bounced to
 the main thread internally.
 """
 import functools
+import math
+import threading
 import time
 import traceback
+from collections import namedtuple
 from pathlib import Path
 
 from AppKit import (NSAppearance, NSColor, NSEvent, NSFont, NSPanel, NSScreen,
@@ -78,7 +94,7 @@ from AppKit import (NSAppearance, NSColor, NSEvent, NSFont, NSPanel, NSScreen,
 from Foundation import (NSMakeRect, NSAttributedString, NSTimer, NSRunLoop,
                         NSRunLoopCommonModes)
 from Quartz import (CALayer, CAGradientLayer, CAShapeLayer, CATextLayer,
-                    CABasicAnimation, CAMediaTimingFunction,
+                    CABasicAnimation, CAMediaTimingFunction, CATransaction,
                     kCAMediaTimingFunctionLinear,
                     kCAMediaTimingFunctionEaseOut,
                     CGPathCreateWithRoundedRect, CGRectMake, CGSizeMake,
@@ -104,6 +120,9 @@ _FADE_OUT  = 0.30
 _FADE_QUIT = 0.10       # dismissed by input: get out of the way, do not linger
 _BLOOM    = 0.75        # how long the words take to rise and settle
 _RISE     = 9.0         # how far below their place the words start
+_STACK_GAP = 8          # between two pills in a stack
+_SLIDE    = 0.3         # share of the way to its new slot a pill covers per tick
+_QUEUED_DIM = 0.55      # words of a note that is waiting its turn
 
 _PREVIEW_WORDS = 8      # most words of the transcript ever shown
 
@@ -125,7 +144,7 @@ _LOG = Path.home() / '.clipbridge' / 'mac_debug.log'
 
 def _log(msg):
     try:
-        with open(_LOG, 'a') as f:
+        with open(_LOG, 'a', encoding='utf-8') as f:
             f.write(f'\nhud {time.strftime("%H:%M:%S")} {msg}')
     except Exception:
         pass
@@ -182,21 +201,146 @@ _SPEED_WORDS = 7.0      # through the glyphs, slow enough to read over
 
 
 # ── Palette ────────────────────────────────────────────────────────────────
-# Taken from the desktop this pill sits on rather than invented for it: the
-# frosted slate of the widgets down the left edge, the teal of the water
-# under Bixby Bridge, and the pale blue of the menu bar. The pill was a
-# black capsule under a rolling rainbow, which matched nothing else on the
-# screen; the ring still drifts, because its speed is how the pill says
-# whether it is listening or working, but it drifts through water now.
+# Taken from the desktop this pill sits on rather than invented for it, and
+# that desktop moves: the wallpaper is a dynamic one, so any fixed set of
+# colours is right for two hours of the day and wrong for the other
+# twenty two. The pill reads the sun instead.
+#
+# The sun's height above the horizon is the whole input, with morning told
+# apart from evening by which side of noon it is. The anchors below are in
+# degrees of elevation, and every hour between two of them is a mix of the
+# pair. Reading the sun rather than the clock is what keeps this honest in
+# December, when seven in the evening is the middle of the night.
+#
+# To see an hour that is not this one, without waiting for it:
+# mac/.venv/bin/python3 mac/tools/hud_demo.py --sweep
+#
+# What each anchor is taken from, on the wallpaper this was drawn against:
+# midday is the deep water past the rocks rising to the pale blue of the
+# menu bar, the horizon is the ember in the ridges and the amber over
+# them, and night is the indigo of the water with moonlight on it. Morning
+# runs cooler and rosier than evening at the same height, because it does.
 
-_GROUND      = (0.118, 0.157, 0.204, 0.58)   # slate wash over the blur
-_ACCENT_DEEP = (0.176, 0.376, 0.451)         # the deep water past the rocks
-_ACCENT_MID  = (0.180, 0.541, 0.596)         # the shallows off the point
-_ACCENT_HIGH = (0.478, 0.702, 0.855)         # the menu bar and the sky
-_SHEEN       = (0.847, 0.906, 0.965)         # the light that crosses the words
+_LAT = 38.05      # Lexington. Only the timing of dawn and dusk rests on
+_LON = -84.50     # this, so a degree out costs minutes and nothing else.
+
+_Palette = namedtuple('_Palette', 'ground deep mid high sheen')
+
+# ground: the wash over the blur. deep, mid, high: the three stops the ring
+# runs through. sheen: the light that crosses the transcript.
+_NIGHT = _Palette(
+    ground=(0.075, 0.086, 0.137, 0.55),
+    deep=(0.106, 0.126, 0.243), mid=(0.216, 0.243, 0.427),
+    high=(0.545, 0.573, 0.741), sheen=(0.792, 0.816, 0.906))
+
+_DAY = _Palette(
+    ground=(0.118, 0.157, 0.204, 0.58),
+    deep=(0.176, 0.376, 0.451), mid=(0.180, 0.541, 0.596),
+    high=(0.478, 0.702, 0.855), sheen=(0.847, 0.906, 0.965))
+
+_DUSK_TWILIGHT = _Palette(
+    ground=(0.110, 0.098, 0.145, 0.57),
+    deep=(0.216, 0.157, 0.290), mid=(0.478, 0.271, 0.365),
+    high=(0.788, 0.510, 0.478), sheen=(0.878, 0.816, 0.839))
+
+_DUSK_HORIZON = _Palette(
+    ground=(0.161, 0.118, 0.106, 0.57),
+    deep=(0.427, 0.204, 0.157), mid=(0.827, 0.443, 0.235),
+    high=(0.973, 0.780, 0.573), sheen=(0.973, 0.898, 0.804))
+
+_DUSK_GOLD = _Palette(
+    ground=(0.153, 0.137, 0.129, 0.58),
+    deep=(0.451, 0.267, 0.196), mid=(0.816, 0.529, 0.310),
+    high=(0.961, 0.831, 0.663), sheen=(0.961, 0.914, 0.855))
+
+_DUSK_LATE = _Palette(
+    ground=(0.129, 0.149, 0.180, 0.58),
+    deep=(0.251, 0.400, 0.463), mid=(0.510, 0.612, 0.647),
+    high=(0.910, 0.827, 0.714), sheen=(0.937, 0.918, 0.878))
+
+_DAWN_TWILIGHT = _Palette(
+    ground=(0.098, 0.106, 0.153, 0.57),
+    deep=(0.157, 0.180, 0.322), mid=(0.361, 0.322, 0.478),
+    high=(0.702, 0.573, 0.639), sheen=(0.867, 0.839, 0.878))
+
+_DAWN_HORIZON = _Palette(
+    ground=(0.137, 0.126, 0.137, 0.57),
+    deep=(0.318, 0.243, 0.333), mid=(0.729, 0.435, 0.427),
+    high=(0.965, 0.792, 0.729), sheen=(0.957, 0.898, 0.878))
+
+_DAWN_GOLD = _Palette(
+    ground=(0.137, 0.129, 0.137, 0.58),
+    deep=(0.353, 0.278, 0.353), mid=(0.749, 0.494, 0.463),
+    high=(0.965, 0.816, 0.749), sheen=(0.957, 0.910, 0.890))
+
+_DAWN_LATE = _Palette(
+    ground=(0.118, 0.153, 0.196, 0.58),
+    deep=(0.212, 0.404, 0.478), mid=(0.322, 0.588, 0.627),
+    high=(0.702, 0.792, 0.882), sheen=(0.894, 0.933, 0.965))
+
+# night, deep twilight, the horizon itself, the golden hour off it, the
+# light going neutral, full day. The last two are close together on
+# purpose: the ring has to cross from amber to water somewhere, and every
+# colour on that road is a grey, so the road is kept short. It falls in
+# the hour when the sky itself is doing the same thing.
+_DUSK = ((-18.0, _NIGHT), (-6.0, _DUSK_TWILIGHT), (2.0, _DUSK_HORIZON),
+         (9.0, _DUSK_GOLD), (20.0, _DUSK_LATE), (32.0, _DAY))
+_DAWN = ((-18.0, _NIGHT), (-6.0, _DAWN_TWILIGHT), (2.0, _DAWN_HORIZON),
+         (9.0, _DAWN_GOLD), (20.0, _DAWN_LATE), (32.0, _DAY))
+
+# A failure is the one state that does not wear the hour. The ring runs
+# through reds instead, the same shape of cycle, so it reads as the same
+# pill saying something went wrong rather than as a different window.
+_FAIL_RING = ((0.420, 0.078, 0.090), (0.843, 0.200, 0.180),
+              (1.000, 0.498, 0.439), (0.843, 0.200, 0.180))
+
 _TEXT        = (1.0, 0.94)
 _TEXT_QUIET  = (1.0, 0.50)
 _TEXT_GLOW   = (1.0, 0.55)
+
+
+def _sun(now=None):
+    """How high the sun stands, in degrees above the horizon, and whether
+    it is still climbing. The low precision formulas are the right ones
+    here: they are good to about a minute, and the colour they feed takes
+    an hour to change. Everything is in UT, so no timezone is involved and
+    a machine that travels needs no resetting."""
+    d = (time.time() if now is None else now) / 86400.0 - 10957.5
+    g = math.radians((357.529 + 0.98560028 * d) % 360.0)
+    q = (280.459 + 0.98564736 * d) % 360.0
+    lam = math.radians(q + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g))
+    eps = math.radians(23.439 - 0.00000036 * d)
+    ra = math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))
+    dec = math.asin(math.sin(eps) * math.sin(lam))
+    gmst = (18.697374558 + 24.06570982441908 * d) % 24.0
+    # hour angle, folded to a half turn either side of noon, so its sign
+    # is the whole of "morning or evening"
+    ha = math.radians(gmst * 15.0 + _LON) - ra
+    ha = (ha + math.pi) % (2 * math.pi) - math.pi
+    lat = math.radians(_LAT)
+    elev = math.degrees(math.asin(
+        math.sin(lat) * math.sin(dec)
+        + math.cos(lat) * math.cos(dec) * math.cos(ha)))
+    return elev, ha < 0.0
+
+
+def _mix(a, b, t):
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+def _palette(now=None):
+    """The colours for this moment, mixed from the two anchors the sun is
+    standing between."""
+    elev, rising = _sun(now)
+    anchors = _DAWN if rising else _DUSK
+    lo = anchors[0]
+    for hi in anchors[1:]:
+        if elev <= hi[0]:
+            span = hi[0] - lo[0]
+            t = min(1.0, max(0.0, (elev - lo[0]) / span))
+            return _Palette(*(_mix(a, b, t) for a, b in zip(lo[1], hi[1])))
+        lo = hi
+    return lo[1]
 
 
 def _rgb(c):
@@ -217,18 +361,18 @@ def _cycle_cgcolors(cycle):
     return cols
 
 
-def _ring_cgcolors():
-    """The ring: deep water rising to the shallows, to the sky, and back."""
-    return _cycle_cgcolors([_ACCENT_DEEP, _ACCENT_MID,
-                            _ACCENT_HIGH, _ACCENT_MID])
+def _ring_cgcolors(pal):
+    """The ring: the deep of the hour rising through its middle to its
+    lightest, and back."""
+    return _cycle_cgcolors([pal.deep, pal.mid, pal.high, pal.mid])
 
 
-def _words_cgcolors():
+def _words_cgcolors(pal):
     """The transcript: white, with a slow sheen crossing it. The words are
     still the thing being shown off, but on this desktop every number that
     matters is plain white, so the colour in them is a highlight moving over
     white rather than a colour of their own."""
-    return _cycle_cgcolors([(1.0, 1.0), _SHEEN])
+    return _cycle_cgcolors([(1.0, 1.0), pal.sheen])
 
 
 class _Ticker:
@@ -308,6 +452,18 @@ class RecordingHUD:
         self._reclaim_at = 0.0
         # whether this pill has already reported being chased
         self._said       = False
+        # normally the real clock. hud_demo pins it to another moment to
+        # look at an hour that is not this one.
+        self._clock      = None
+        # the PillStack this pill belongs to, or None for a lone pill that
+        # follows the pointer by itself
+        self._stack      = None
+        # how far below the top of its stack this pill is drawn right now,
+        # which trails the slot it is heading for while it slides
+        self._slot       = None
+        # called on the main thread once the pill has faded out and left
+        # the screen, whatever sent it away
+        self.on_gone     = None
 
     # ── public, callable from any thread ───────────────────────────────────────
 
@@ -320,9 +476,34 @@ class RecordingHUD:
     def flash(self, text, seconds=1.8):
         AppHelper.callAfter(self._enter_flash, text, seconds)
 
+    def failed(self, text, seconds=3.0):
+        """A flash with a red ring, for something that did not work."""
+        AppHelper.callAfter(self._enter_failed, text, seconds)
+
     def copied(self, transcript, seconds=2.9):
-        """The clipboard now holds transcript. Show its opening words."""
-        AppHelper.callAfter(self._enter_copied, transcript, seconds)
+        """The clipboard now holds transcript. Show its opening words.
+        With seconds None the pill stays until hide() or linger()."""
+        AppHelper.callAfter(self._enter_copied, transcript, seconds,
+                            'copied to clipboard', False)
+
+    def pasted(self, transcript, caption='pasted', seconds=2.9):
+        """transcript went where it was pinned, as caption says."""
+        AppHelper.callAfter(self._enter_copied, transcript, seconds,
+                            caption, False)
+
+    def queued(self, transcript):
+        """transcript is ready and is not on the clipboard yet. Shown dimmed,
+        and it stays until the pill is told what happens next."""
+        AppHelper.callAfter(self._enter_copied, transcript, None,
+                            'queued', True)
+
+    def hold(self):
+        """Stop a timed pill from leaving on its own."""
+        AppHelper.callAfter(self._hold)
+
+    def linger(self, seconds=2.9):
+        """Let a held pill leave after seconds, or at the next key or click."""
+        AppHelper.callAfter(self._linger, seconds)
 
     def hide(self):
         AppHelper.callAfter(self._fade_out)
@@ -354,6 +535,15 @@ class RecordingHUD:
     def _enter_flash(self, text, seconds):
         self._flash_line(text, seconds)
 
+    @_guard
+    def _enter_failed(self, text, seconds):
+        self._flash_line(text, seconds)
+        # after _flash_line, whose _ensure puts the hour's colours back
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        self._grad.setColors_(_cycle_cgcolors(_FAIL_RING))
+        CATransaction.commit()
+
     def _flash_line(self, text, seconds):
         self._ensure()
         self._stop_tick()
@@ -363,19 +553,34 @@ class RecordingHUD:
         self._arm_hider(seconds)
 
     @_guard
-    def _enter_copied(self, transcript, seconds):
+    def _enter_copied(self, transcript, seconds, caption, dim):
         self._ensure()
         self._stop_tick()
+        self._hold()
         preview = self._preview(transcript or '')
         if not preview:
             # nothing worth quoting, so say it the plain way
-            self._flash_line('Copied to clipboard', 1.8)
-            return
-        self._set_copied(preview)
-        self._set_speed(_SPEED_FLASH)
-        self._fade_in()
-        self._bloom_in()
-        self._arm_hider(seconds)
+            self._set_line(caption[:1].upper() + caption[1:])
+            self._set_speed(_SPEED_FLASH)
+            self._fade_in()
+        else:
+            self._set_copied(preview, caption, dim)
+            self._set_speed(_SPEED_FLASH)
+            self._fade_in()
+            self._bloom_in()
+        if seconds is not None:
+            self._arm_hider(seconds)
+
+    @_guard
+    def _hold(self):
+        self._hide_at  = None
+        self._input_at = None
+        self._hider.stop()
+
+    @_guard
+    def _linger(self, seconds):
+        if self._up:
+            self._arm_hider(seconds)
 
     def _arm_hider(self, seconds):
         """This pill leaves on its own after seconds, or sooner if you
@@ -416,6 +621,7 @@ class RecordingHUD:
 
     def _ensure(self):
         if self._panel is not None:
+            self._repaint()
             return
         style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -453,8 +659,8 @@ class RecordingHUD:
         # A wash over the blur rather than a solid fill, so what is behind
         # still comes through the way it does under a widget. Dark enough
         # that white text holds over the brightest part of a wallpaper, and
-        # that the glow around the words has something to glow off.
-        pill.setBackgroundColor_(_rgb(_GROUND).CGColor())
+        # that the glow around the words has something to glow off. Its
+        # colour, and the ring's, and the sheen's, arrive in _repaint below.
         pill.setCornerRadius_(_HEIGHT / 2.0)
         view.layer().addSublayer_(pill)
 
@@ -467,7 +673,6 @@ class RecordingHUD:
         ring.setMask_(mask)
 
         grad = CAGradientLayer.layer()
-        grad.setColors_(_ring_cgcolors())
         grad.setStartPoint_((0.0, 0.5))
         grad.setEndPoint_((1.0, 0.5))
         ring.addSublayer_(grad)
@@ -514,7 +719,6 @@ class RecordingHUD:
         wrap.setMask_(words_mask)
 
         words = CAGradientLayer.layer()
-        words.setColors_(_words_cgcolors())
         words.setStartPoint_((0.0, 0.5))
         words.setEndPoint_((1.0, 0.5))
         wrap.addSublayer_(words)
@@ -527,6 +731,22 @@ class RecordingHUD:
         self._caption, self._bloom, self._glow, self._wrap = \
             caption, bloom, glow, wrap
         self._words_mask, self._words = words_mask, words
+        self._repaint()
+
+    def _repaint(self):
+        """Take the colours the hour is owed. Every state entry comes
+        through _ensure, so a pill picks up the light it appears in, and
+        nothing changes underneath one that is already up: they live for
+        seconds, and a ring changing hue mid sentence would read as a
+        state change rather than as the time of day. Actions are off
+        because these are new colours, not a transition between two."""
+        pal = _palette(self._clock)
+        CATransaction.begin()
+        CATransaction.setDisableActions_(True)
+        self._pill.setBackgroundColor_(_rgb(pal.ground).CGColor())
+        self._grad.setColors_(_ring_cgcolors(pal))
+        self._words.setColors_(_words_cgcolors(pal))
+        CATransaction.commit()
 
     # ── content ────────────────────────────────────────────────────────────────
 
@@ -582,13 +802,15 @@ class RecordingHUD:
             0, (self._height - self._label.frame().size.height) / 2.0 - 0.5,
             self._width, self._label.frame().size.height))
 
-    def _set_copied(self, preview):
+    def _set_copied(self, preview, caption='copied to clipboard', dim=False):
         """Two line state: a quiet caption over the words, which take the
-        spectrum off the ring."""
+        spectrum off the ring. A queued note is drawn the same way with its
+        words dimmed, so the one on the clipboard is the bright one."""
         self._mode = 'copied'
         self._label.setHidden_(True)
         self._caption.setHidden_(False)
         self._bloom.setHidden_(False)
+        self._bloom.setOpacity_(_QUEUED_DIM if dim else 1.0)
         # The ring holds its colour here. It used to drop almost out of
         # sight because the words took the spectrum off it, and there is no
         # spectrum to hand over any more: the ring is the only colour on the
@@ -596,7 +818,7 @@ class RecordingHUD:
         # is white.
         self._ring.setOpacity_(1.0)
 
-        cap_attr = _attributed('copied to clipboard', self._caption_font,
+        cap_attr = _attributed(caption, self._caption_font,
                                _rgb(_TEXT_QUIET), 1.4)
         wrd_attr = _attributed(preview, self._words_font,
                                NSColor.whiteColor())
@@ -688,7 +910,9 @@ class RecordingHUD:
 
         fade = CABasicAnimation.animationWithKeyPath_('opacity')
         fade.setFromValue_(0.0)
-        fade.setToValue_(1.0)
+        # to wherever the words are meant to settle, which is short of full
+        # for a queued note, so the fade does not end on a jump
+        fade.setToValue_(self._bloom.opacity())
         fade.setDuration_(_BLOOM)
         fade.setTimingFunction_(ease)
         self._bloom.addAnimation_forKey_(fade, 'bloom')
@@ -733,7 +957,13 @@ class RecordingHUD:
         """Sit just below the pointer, centered on it, and never off the
         edge of its screen. Clamping is what makes a cursor in a corner
         still readable: the pill slides along the edge rather than
-        hanging half off it."""
+        hanging half off it. A pill in a stack is placed by the stack,
+        which has to consider every pill in it at once."""
+        if self._stack is not None:
+            origin = self._stack._origin_for(self)
+            if origin is not None:
+                self._panel.setFrameOrigin_(origin)
+            return
         mouse  = NSEvent.mouseLocation()
         screen = self._screen_under(mouse)
         if screen is None:
@@ -844,7 +1074,12 @@ class RecordingHUD:
         self._panel.setCollectionBehavior_(_BEHAVIOR)
         self._panel.orderFrontRegardless()
         try:
-            self._follow.start()
+            # a stacked pill is moved by the stack's one timer, so the whole
+            # column samples the pointer together and never shears apart
+            if self._stack is not None:
+                self._stack._start()
+            else:
+                self._follow.start()
         except Exception:
             pass
         NSAnimationContext.beginGrouping()
@@ -852,9 +1087,23 @@ class RecordingHUD:
         self._panel.animator().setAlphaValue_(1.0)
         NSAnimationContext.endGrouping()
 
+    def _gone(self):
+        """The pill has left the screen. Its stack takes the slot back and
+        whoever was waiting on it hears about it, once."""
+        if self._stack is not None:
+            self._stack._release(self)
+        callback, self.on_gone = self.on_gone, None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                _log(f'on_gone failed\n{traceback.format_exc()}')
+
     @_guard
     def _fade_out(self, seconds=_FADE_OUT):
         if self._panel is None:
+            self._up = False
+            self._gone()
             return
         # the pill stops belonging on screen the moment it is asked to
         # leave, before the fade, so nothing reclaims it out from under
@@ -867,6 +1116,7 @@ class RecordingHUD:
         self._stop_tick()
         self._stop_follow()
         if not self._panel.isVisible():
+            self._gone()
             return
         self._gen += 1
         gen = self._gen
@@ -882,7 +1132,114 @@ class RecordingHUD:
             # was running, and that one owns the panel now
             if self._gen == gen and self._panel is not None:
                 self._panel.orderOut_(None)
+                self._gone()
         # held on the instance, so nothing can collect the timer before
         # it fires and leave the panel stranded at zero alpha
         self._finisher = _Ticker(_finish, seconds + 0.05)
         self._finisher.start()
+
+
+class PillStack:
+    """A column of pills under the pointer, newest on top.
+
+    acquire() hands out a pill already placed at the top of the column.
+    The pill leaves the column by itself when it fades out, and the pills
+    under it slide up into the space. Nothing else is needed to manage
+    one: call its states the same as a lone RecordingHUD.
+
+    One timer moves the whole column. Each pill running its own would read
+    the pointer at a different moment and the column would shear apart
+    while the pointer moves."""
+
+    def __init__(self):
+        self._pool    = []        # every pill ever made, reused, never freed
+        self._members = []        # in the column, top to bottom
+        self._lock    = threading.Lock()
+        self._tick    = _Ticker(self._on_tick, _FOLLOW)
+        self._shown   = []
+        self._total   = 0.0
+
+    def acquire(self):
+        """A pill at the top of the column. Safe from any thread."""
+        with self._lock:
+            pill = next((p for p in self._pool if p not in self._members),
+                        None)
+            if pill is None:
+                pill = RecordingHUD()
+                pill._stack = self
+                self._pool.append(pill)
+            pill.on_gone = None
+            pill._slot   = None
+            self._members.insert(0, pill)
+        return pill
+
+    def _release(self, pill):
+        with self._lock:
+            if pill in self._members:
+                self._members.remove(pill)
+
+    def _start(self):
+        self._tick.start()
+
+    def _arrange(self, advance):
+        """Work out which pills take up room and where each one is headed.
+        A pill that has not come up yet takes none, and one fading out
+        keeps its room until it is gone. A pill new to the column starts in
+        its slot; the others ease toward theirs when advance is set."""
+        with self._lock:
+            members = list(self._members)
+        shown = [p for p in members if p._up or
+                 (p._panel is not None and p._panel.isVisible())]
+        still = _reduce_motion()
+        offset = 0.0
+        for p in shown:
+            if p._slot is None or still:
+                p._slot = offset
+            elif advance:
+                p._slot += (offset - p._slot) * _SLIDE
+                if abs(offset - p._slot) < 0.5:
+                    p._slot = offset
+            offset += p._height + _STACK_GAP
+        self._shown = shown
+        self._total = max(0.0, offset - _STACK_GAP)
+        return members
+
+    @_guard
+    def _on_tick(self, _timer=None):
+        members = self._arrange(advance=True)
+        if not members:
+            self._tick.stop()
+            return
+        for p in self._shown:
+            p._on_follow()
+
+    def _origin_for(self, pill):
+        """Where pill goes. The column hangs below the pointer when it fits
+        there and stands above it when it does not, newest nearest the
+        pointer either way, and the column is kept on screen as one piece."""
+        if pill not in self._shown or pill._slot is None:
+            self._arrange(advance=False)
+        mouse  = NSEvent.mouseLocation()
+        screen = pill._screen_under(mouse)
+        if screen is None:
+            return None
+        vf = screen.visibleFrame()
+        w, h = pill._width, pill._height
+        slot = pill._slot or 0.0
+
+        left  = vf.origin.x + _EDGE_GAP
+        right = vf.origin.x + vf.size.width - w - _EDGE_GAP
+        x = mouse.x - w / 2.0
+        x = max(left, min(x, right)) if right > left else left
+
+        floor = vf.origin.y + _EDGE_GAP
+        ceil  = vf.origin.y + vf.size.height - _EDGE_GAP
+        top   = mouse.y - _CURSOR
+        if top - self._total >= floor:
+            top = min(top, ceil)
+            y = top - slot - h
+        else:
+            bottom = mouse.y + _CURSOR
+            bottom = max(floor, min(bottom, ceil - self._total))
+            y = bottom + slot
+        return (x, y)

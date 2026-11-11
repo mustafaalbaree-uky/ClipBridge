@@ -25,6 +25,17 @@ fi
 rm -rf build dist
 .venv/bin/python3 setup.py py2app
 
+# Signed with the Apple Development certificate when there is one. An ad hoc
+# signature changes on every build, and macOS drops the Accessibility grant
+# along with it; a certificate signature stays the same, so the grant holds.
+IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/ {print $2; exit}')
+if [ -n "$IDENTITY" ]; then
+    codesign --force --deep --sign "$IDENTITY" dist/ClipBridge.app
+    echo "Signed as $IDENTITY"
+else
+    echo "No Apple Development certificate, left ad hoc signed"
+fi
+
 echo
 echo "Built dist/ClipBridge.app"
 

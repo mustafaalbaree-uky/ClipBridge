@@ -59,7 +59,7 @@ curl -L -o ~/.clipbridge/models/ggml-large-v3-turbo.bin \
 cd mac && ./build.sh --install
 ```
 
-With no Supabase URL and key in the config, the menu has only the voice note items and a left click on the icon opens it. Everything below about the backend, Windows and the iPhone can be skipped. The hotkeys and settings are under [5. Voice notes](#5-voice-notes-optional).
+With no Supabase URL and key in the config, the menu has only the voice note items and a left click on the icon opens it. Everything below about the backend, Windows and the iPhone can be skipped. The hotkeys and settings are under [5. Voice notes](#5-voice-notes-optional). To have an AI assistant do the install for someone and teach them to use it, point it at [`INSTALL-WITH-CLAUDE.md`](INSTALL-WITH-CLAUDE.md).
 
 
 ### 1. The backend (five minutes, free)

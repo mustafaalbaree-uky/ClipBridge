@@ -157,6 +157,10 @@ In Terminal this does not use keystrokes. ClipBridge notes the tab's tty when yo
 | `pin_send_hotkey` | no | Mac, pin the newest note and press Return once it is in, default `<ctrl>+<alt>+c` |
 | `encrypt_to_pc` | no | Mac, encrypt clips sent to the PC, default false until the Windows tray can decrypt them |
 
+## Notes in Arabic, or Arabic mixed with English
+
+Voice notes are transcribed as English, which suits daily use and turns an Arabic recording into invented English. For the occasional Arabic one, run `mac/tools/mixednote.py` (linked as `mixednote`): with no argument it takes the newest note in `~/.clipbridge/notes`, or pass any recording. It runs whisper.cpp `large-v3` on this Mac, nothing uploaded, cuts the recording at pauses into pieces of about 15 seconds, detects the language per piece, and redoes pieces that look wrong in both Arabic and English. The result is `<note>.mixed.txt` beside the recording. It needs `~/.cache/lecpipe/models/ggml-large-v3.bin` (3.1 GB).
+
 ## Privacy
 
 Clips are encrypted on the device before they reach Supabase, in the `cb1` format described in [`shared/cbcrypt.py`](shared/cbcrypt.py): AES-256-GCM under a key made from a five word passphrase, with the clip's source sealed in and a timestamp that refuses replays. The anon key is published wherever the QR Bridge page is, so the table is treated as open to anyone; a clip that does not decrypt with your passphrase is dropped, which is also what stops anyone pushing text onto your clipboard. On the Mac, `python3 mac/tools/new_passphrase.py` makes the passphrase and stores it in the login Keychain (service `ClipBridge`, account `passphrase`); type the same words into the Windows tray and the QR Bridge page. `qr-bridge/test/cb1_compat.mjs` checks that the page and this module still agree.

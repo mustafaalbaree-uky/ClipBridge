@@ -144,6 +144,10 @@ Settings live in `~/.clipbridge/config.json`. It does not exist by default, and 
 * `record_hotkey`: a different key combination for recording. Modifiers are `<ctrl>`, `<alt>` (Option), `<cmd>`, `<shift>`.
 * `whisper_vocabulary`: a sentence or two of names, places or terms the transcripts misspell. It helps whisper spell them right.
 
+* `type_clipboard_hotkey`: a key combination, for example `<ctrl>+<alt>+t`, that types whatever is on the clipboard at the cursor one character at a time instead of pasting it as one block. Pressing it again while it types stops it. It needs Accessibility permission (System Settings > Privacy & Security > Accessibility > ClipBridge).
+* `type_each_character`: `true` makes the pin hotkey type one character at a time too.
+* `type_delay_ms`: the pause between characters, default 20.
+
 After changing it, quit ClipBridge from its menu and open it again from Applications.
 
 There is also a pin feature (Control + Option + V types the transcript straight into a text field). It needs Accessibility permission and is described in the README. Leave it out of the first lesson; mention it only if they ask for something like it.

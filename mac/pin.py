@@ -230,18 +230,82 @@ def _post(ev):
     Q.CGEventPost(Q.kCGHIDEventTap, ev)
 
 
+# How much one typed keystroke carries, and the pause after each. Sixteen
+# characters at a time is the default. type_each_character in the config
+# makes it one, so a document's history records each character as its own
+# keystroke rather than runs of sixteen.
+_TYPE_CHUNK = 16
+_TYPE_PAUSE = 0.01
+# The pause between characters when typing one at a time.
+_CHAR_PAUSE = 0.02
+
+
+def configure_typing(each_character=False, delay_ms=None):
+    global _TYPE_CHUNK, _TYPE_PAUSE, _CHAR_PAUSE
+    if delay_ms is not None:
+        try:
+            _CHAR_PAUSE = max(0.0, float(delay_ms) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    if each_character:
+        _TYPE_CHUNK, _TYPE_PAUSE = 1, _CHAR_PAUSE
+
+
+def _type_chunk(src, chunk):
+    for down in (True, False):
+        ev = Q.CGEventCreateKeyboardEvent(src, 0, down)
+        Q.CGEventKeyboardSetUnicodeString(ev, _u16(chunk), chunk)
+        Q.CGEventSetFlags(ev, 0)
+        _post(ev)
+
+
 def type_text(text):
     """Type text at the cursor as keystrokes carrying no modifiers, even
     while the pin hotkey's own modifiers are still held down."""
     src = Q.CGEventSourceCreate(Q.kCGEventSourceStatePrivate)
-    for i in range(0, len(text), 16):
-        chunk = text[i:i + 16]
-        for down in (True, False):
-            ev = Q.CGEventCreateKeyboardEvent(src, 0, down)
-            Q.CGEventKeyboardSetUnicodeString(ev, _u16(chunk), chunk)
-            Q.CGEventSetFlags(ev, 0)
-            _post(ev)
-        time.sleep(0.01)
+    for i in range(0, len(text), _TYPE_CHUNK):
+        _type_chunk(src, text[i:i + _TYPE_CHUNK])
+        time.sleep(_TYPE_PAUSE)
+
+
+_KEY_TAB = 48
+
+
+def _wait_modifiers_up(limit_sec=2.0):
+    """Wait for the hotkey's modifiers to be let go, so the first typed
+    characters do not land as shortcuts in apps that read the live key
+    state rather than the event's own flags."""
+    mask = (Q.kCGEventFlagMaskControl | Q.kCGEventFlagMaskAlternate |
+            Q.kCGEventFlagMaskCommand | Q.kCGEventFlagMaskShift)
+    end = time.time() + limit_sec
+    while time.time() < end:
+        state = Q.CGEventSourceFlagsState(
+            Q.kCGEventSourceStateCombinedSessionState)
+        if not state & mask:
+            return
+        time.sleep(0.02)
+
+
+def type_each(text, stop=None):
+    """Type text one character per keystroke, for a document: a newline is
+    a Return and a tab is the Tab key. Stops early when stop is set. Returns
+    how many characters were typed. Off the main thread."""
+    _wait_modifiers_up()
+    src = Q.CGEventSourceCreate(Q.kCGEventSourceStatePrivate)
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    typed = 0
+    for ch in text:
+        if stop is not None and stop.is_set():
+            break
+        if ch == '\n':
+            press(_KEY_RETURN)
+        elif ch == '\t':
+            press(_KEY_TAB)
+        else:
+            _type_chunk(src, ch)
+        typed += 1
+        time.sleep(_CHAR_PAUSE)
+    return typed
 
 
 def press(code, times=1, flags=0):

@@ -54,6 +54,11 @@ Return once the transcript is in, so a prompt dictated into Claude Code or a
 chat box goes out on its own. In Terminal it reaches the tab it was pinned in
 through AppleScript, so the window can be behind others by then.
 
+The type clipboard hotkey (type_clipboard_hotkey, off unless set) types
+whatever text is on the clipboard at the cursor, one character per
+keystroke, so an editor sees typing rather than one pasted block. Pressed
+again while typing, it stops.
+
 Recording is done by AVAudioRecorder, which writes straight into
 ~/.clipbridge/pending/partial, so the audio is on disk while it is still
 being spoken rather than only after the fact, and moves up into
@@ -201,6 +206,12 @@ LOCAL_ASR    = localasr is not None and localasr.available()
 HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
 PIN_HOTKEY   = _cfg.get('pin_hotkey', '<ctrl>+<alt>+v')
 PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+c')
+# Types whatever text is on the clipboard at the cursor, one character per
+# keystroke. Off unless a key is given.
+TYPE_CLIPBOARD_HOTKEY = _cfg.get('type_clipboard_hotkey', '')
+if pin is not None and pin.HAS_AX:
+    pin.configure_typing(bool(_cfg.get('type_each_character', False)),
+                         _cfg.get('type_delay_ms'))
 SAMPLERATE   = 16000
 # Clips to the PC stay plaintext until the Windows tray can decrypt them.
 ENCRYPT_TO_PC = bool(_cfg.get('encrypt_to_pc', False))
@@ -1036,6 +1047,7 @@ class ClipBridge(rumps.App):
                 diag['register_error'] = traceback.format_exc()
         self._pin_handle = None
         self._pin_send_handle = None
+        self._typing_stop = None
         diag['pin'] = 'off, pin.py did not import' if pin is None else \
                       'off, no accessibility bindings' if not pin.HAS_AX else \
                       f'hotkey {PIN_HOTKEY}, send {PIN_SEND_HOTKEY}, ' \
@@ -1066,6 +1078,23 @@ class ClipBridge(rumps.App):
                     self._pin_send_handle = _fire_pin_send
             except Exception as e:
                 diag['pin_send_register_error'] = str(e)
+            self._type_handle = None
+            if TYPE_CLIPBOARD_HOTKEY:
+                try:
+                    parsed = _parse_hotkey(TYPE_CLIPBOARD_HOTKEY)
+                    if parsed:
+                        vk, mods = parsed
+
+                        @quickHotKey(virtualKey=vk, modifierMask=mods)
+                        def _fire_type():
+                            _on_main(self._type_clipboard_fired)
+
+                        self._type_handle = _fire_type
+                        diag['type_clipboard'] = TYPE_CLIPBOARD_HOTKEY
+                    else:
+                        diag['type_clipboard'] = 'hotkey not understood'
+                except Exception as e:
+                    diag['type_clipboard_register_error'] = str(e)
             self._tap = pin.ClickTap(self._pin_target, self._pin_click)
             # the tap can only be made once Accessibility is granted, which
             # may happen after launch, so keep trying until it is
@@ -1584,6 +1613,44 @@ class ClipBridge(rumps.App):
             self._hud_flash('Accessibility is off for ClipBridge.')
         else:
             self._start_pin(note, None, send)
+
+    def _type_clipboard_fired(self):
+        """Type the clipboard's text at the cursor one character at a time.
+        Pressed again while typing, it stops."""
+        if self._typing_stop is not None:
+            self._typing_stop.set()
+            return
+        if not pin.trusted():
+            pin.trusted(prompt=True)
+            self._hud_flash('Accessibility is off for ClipBridge.')
+            return
+        # read here on the main thread: when the clipboard holds a note this
+        # app promised, AppKit asks this app for it in process, and the read
+        # counts as the note's paste, so the queue moves on as after Command V
+        text = NSPasteboard.generalPasteboard().stringForType_(
+            NSPasteboardTypeString) if HAS_APPKIT else _paste()
+        if not text:
+            self._hud_flash('Clipboard has no text.')
+            return
+        stop = threading.Event()
+        self._typing_stop = stop
+        self._hud_flash(f'Typing {len(text)} characters.')
+
+        def run():
+            typed = 0
+            try:
+                typed = pin.type_each(str(text), stop)
+            except Exception as e:
+                _debug_line(f'type clipboard failed: {e}')
+            _on_main(self._type_clipboard_done, stop, typed, len(text))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _type_clipboard_done(self, stop, typed, total):
+        if self._typing_stop is stop:
+            self._typing_stop = None
+        _debug_line(f'typed {typed} of {total} characters')
+        if typed < total:
+            self._hud_flash(f'Stopped at {typed} of {total} characters.')
 
     def _pin_click(self, x, y):
         note = self._pin_target()

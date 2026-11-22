@@ -215,6 +215,9 @@ DICTATE_SEND_HOTKEY = _cfg.get('dictate_send_hotkey', '')
 # Said at the very end of a note stopped by the dictate hotkey, one of these
 # is taken off and Return is pressed after the transcript, so the one key
 # sends only when told to out loud.
+# A second press of a dictate hotkey this soon after the press that stopped
+# a note sends that note instead of starting another. Typing waits this long.
+DICTATE_DOUBLE_SEC = float(_cfg.get('dictate_double_press_sec', 0.4))
 DICTATE_SEND_WORDS = [w.strip().lower() for w in
                       _cfg.get('dictate_send_words', ['send it']) if w.strip()]
 
@@ -930,7 +933,8 @@ if HAS_APPKIT:
 class _Note:
     """One voice note between the hotkey and the clipboard, with the pill
     that shows where it is."""
-    __slots__ = ('pill', 'state', 'text', 'held', 'pin', 'missed', 'dictate')
+    __slots__ = ('pill', 'state', 'text', 'held', 'pin', 'missed', 'dictate',
+                 'stopped_at')
 
     def __init__(self, pill):
         self.pill  = pill
@@ -944,6 +948,7 @@ class _Note:
         # stopped by a dictate hotkey: typed at the cursor the moment its
         # transcript lands, True when Return follows. None otherwise.
         self.dictate = None
+        self.stopped_at = 0.0   # when a dictate hotkey stopped it
 
 
 class _NoPill:
@@ -1045,6 +1050,7 @@ class ClipBridge(rumps.App):
         # recorded. Touched on the main thread only.
         self._notes    = []
         self._rec_note = None
+        self._dictate_last = None   # the note a dictate hotkey last stopped
         self._replaying = False
         # the note on the clipboard as a promise, the pasteboard's change
         # count right after it went there, and the timer comparing the two
@@ -1567,6 +1573,11 @@ class ClipBridge(rumps.App):
         note.text  = text
         note.state = 'ready'
         if note.dictate is not None and pin is not None and pin.HAS_AX:
+            wait = note.stopped_at + DICTATE_DOUBLE_SEC - time.time()
+            if wait > 0:
+                # a second press may still come and make this one send
+                AppHelper.callLater(wait, self._note_ready, note, text)
+                return
             if pin.trusted():
                 send = note.dictate
                 if not send:
@@ -1730,11 +1741,19 @@ class ClipBridge(rumps.App):
         redrawing can keep from happening for the full wait. Pressed while
         the microphone is still coming up, it cancels, as the record hotkey
         does."""
+        last = self._dictate_last
         if self._rec_on:
             note = self._rec_note
             self._toggle_record(None)
             if note is not None:
                 note.dictate = send
+                note.stopped_at = time.time()
+                self._dictate_last = note
+        elif last is not None and \
+                time.time() - last.stopped_at < DICTATE_DOUBLE_SEC:
+            # the second half of a double press: send the note just stopped
+            self._dictate_last = None
+            last.dictate = True
         else:
             self._toggle_record(None)
 

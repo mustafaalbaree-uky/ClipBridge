@@ -206,6 +206,12 @@ LOCAL_ASR    = localasr is not None and localasr.available()
 HOTKEY       = _cfg.get('record_hotkey', '<ctrl>+<alt>+space')
 PIN_HOTKEY   = _cfg.get('pin_hotkey', '<ctrl>+<alt>+v')
 PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+c')
+# One key for a whole note into the focused field: the first press starts
+# recording, the next stops it and pins it at the cursor. The send version
+# also presses Return once the transcript is in. Off unless a key is given;
+# made for a mouse button that sends the keystroke.
+DICTATE_HOTKEY      = _cfg.get('dictate_hotkey', '')
+DICTATE_SEND_HOTKEY = _cfg.get('dictate_send_hotkey', '')
 # Types whatever text is on the clipboard at the cursor, one character per
 # keystroke. Off unless a key is given.
 TYPE_CLIPBOARD_HOTKEY = _cfg.get('type_clipboard_hotkey', '')
@@ -1116,6 +1122,26 @@ class ClipBridge(rumps.App):
                     self._pin_send_handle = _fire_pin_send
             except Exception as e:
                 diag['pin_send_register_error'] = str(e)
+            self._dictate_handles = []
+            for spec, send, name in ((DICTATE_HOTKEY, False, 'dictate'),
+                                     (DICTATE_SEND_HOTKEY, True, 'dictate_send')):
+                if not spec:
+                    continue
+                try:
+                    parsed = _parse_hotkey(spec)
+                    if not parsed:
+                        diag[name] = 'hotkey not understood'
+                        continue
+                    vk, mods = parsed
+
+                    @quickHotKey(virtualKey=vk, modifierMask=mods)
+                    def _fire_dictate(send=send):
+                        _on_main(self._dictate_fired, send)
+
+                    self._dictate_handles.append(_fire_dictate)
+                    diag[name] = spec
+                except Exception as e:
+                    diag[f'{name}_register_error'] = str(e)
             self._type_handle = None
             if TYPE_CLIPBOARD_HOTKEY:
                 try:
@@ -1658,6 +1684,17 @@ class ClipBridge(rumps.App):
             self._hud_flash('Accessibility is off for ClipBridge.')
         else:
             self._start_pin(note, None, send)
+
+    def _dictate_fired(self, send=False):
+        """The dictate hotkeys: start a note, or stop the one recording and
+        pin it to the focused field (pressing Return after when send is
+        set). Pressed while the microphone is still coming up, it cancels,
+        as the record hotkey does."""
+        if self._rec_on:
+            self._toggle_record(None)
+            self._pin_hotkey_fired(send)
+        else:
+            self._toggle_record(None)
 
     def _type_clipboard_fired(self):
         """Type the clipboard's text at the cursor one character at a time.

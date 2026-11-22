@@ -562,6 +562,44 @@ def _finish_recorder(rec, path):
         return None
 
 
+# A live microphone in a silent room still has a noise floor dozens of steps
+# above zero. A recording whose loudest sample stays at or under this many
+# steps of 16 bit audio came from an input that delivered nothing at all: a
+# MacBook microphone with the lid closed, which macOS cuts off in hardware
+# while still listing it as the default input. Whisper turns that into
+# "you", so it is caught here instead of transcribed.
+DEAD_INPUT_PEAK = 2
+
+
+def _is_dead_input(path):
+    try:
+        audio, _ = sf.read(str(path), dtype='int16')
+        return int(np.abs(audio.astype(np.int32)).max()) <= DEAD_INPUT_PEAK
+    except Exception:
+        return False
+
+
+def _dead_input_message():
+    name = 'the microphone'
+    try:
+        dev = _avf.AVCaptureDevice.defaultDeviceWithMediaType_(
+            _avf.AVMediaTypeAudio)
+        if dev is not None:
+            name = str(dev.localizedName())
+    except Exception:
+        pass
+    message = f'No sound from {name}.'
+    try:
+        out = subprocess.run(['ioreg', '-r', '-k', 'AppleClamshellState',
+                              '-d', '1'], capture_output=True, text=True,
+                             timeout=2).stdout
+        if '"AppleClamshellState" = Yes' in out and 'MacBook' in name:
+            message += ' The lid is closed.'
+    except Exception:
+        pass
+    return message
+
+
 def _recover_part_files():
     """A file left in PARTIAL_DIR means the app died mid recording. Promote it
     so the retry sweep transcribes it instead of leaving it to rot. The .rec
@@ -1432,6 +1470,13 @@ class ClipBridge(rumps.App):
             final = _finish_recorder(rec, path)
             if final is None:
                 _on_main(self._note_failed, note, 'Nothing recorded.', 1.8)
+                return
+            if _is_dead_input(final):
+                _debug_line('recording was digital silence, not transcribed')
+                _discard_pending(final)
+                final = None
+                _on_main(self._note_failed, note, _dead_input_message(),
+                         4.0, True)
                 return
             with self._inflight_lock:
                 self._inflight.add(str(final))

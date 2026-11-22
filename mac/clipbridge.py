@@ -912,7 +912,7 @@ if HAS_APPKIT:
 class _Note:
     """One voice note between the hotkey and the clipboard, with the pill
     that shows where it is."""
-    __slots__ = ('pill', 'state', 'text', 'held', 'pin', 'missed')
+    __slots__ = ('pill', 'state', 'text', 'held', 'pin', 'missed', 'dictate')
 
     def __init__(self, pill):
         self.pill  = pill
@@ -923,6 +923,9 @@ class _Note:
         # set when the transcript goes into a text field instead of the queue
         self.pin   = None
         self.missed = False     # a pin that went nowhere, now on the clipboard
+        # stopped by a dictate hotkey: typed at the cursor the moment its
+        # transcript lands, True when Return follows. None otherwise.
+        self.dictate = None
 
 
 class _NoPill:
@@ -1545,6 +1548,11 @@ class ClipBridge(rumps.App):
             return
         note.text  = text
         note.state = 'ready'
+        if note.dictate is not None and pin is not None and pin.HAS_AX:
+            if pin.trusted():
+                self._start_pin(note, None, note.dictate)
+                return
+            self._hud_flash('Accessibility is off for ClipBridge.')
         if note is not self._notes[0] or self._paused:
             note.pill.queued(text)
         self._advance()
@@ -1687,12 +1695,17 @@ class ClipBridge(rumps.App):
 
     def _dictate_fired(self, send=False):
         """The dictate hotkeys: start a note, or stop the one recording and
-        pin it to the focused field (pressing Return after when send is
-        set). Pressed while the microphone is still coming up, it cancels,
-        as the record hotkey does."""
+        have its transcript typed at the cursor as soon as it lands (pressing
+        Return after when send is set). No marker is typed: in a terminal the
+        marker swap waits for the screen to hold still, which Claude Code's
+        redrawing can keep from happening for the full wait. Pressed while
+        the microphone is still coming up, it cancels, as the record hotkey
+        does."""
         if self._rec_on:
+            note = self._rec_note
             self._toggle_record(None)
-            self._pin_hotkey_fired(send)
+            if note is not None:
+                note.dictate = send
         else:
             self._toggle_record(None)
 

@@ -354,8 +354,12 @@ def _tail(text):
 
 
 def _rule(line):
+    """A full width rule. Claude Code writes a named session's name into
+    the rule above its input box (──── my session ─), so a label between
+    runs of rule is allowed."""
     s = line.strip()
-    return len(s) >= 10 and set(s) == {'─'}
+    return len(s) >= 10 and (set(s) == {'─'} or
+                             re.fullmatch(r'─{10,} [^─]+ ─+', s) is not None)
 
 
 def input_box(screen):

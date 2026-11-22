@@ -212,6 +212,24 @@ PIN_SEND_HOTKEY = _cfg.get('pin_send_hotkey', '<ctrl>+<alt>+c')
 # made for a mouse button that sends the keystroke.
 DICTATE_HOTKEY      = _cfg.get('dictate_hotkey', '')
 DICTATE_SEND_HOTKEY = _cfg.get('dictate_send_hotkey', '')
+# Said at the very end of a note stopped by the dictate hotkey, one of these
+# is taken off and Return is pressed after the transcript, so the one key
+# sends only when told to out loud.
+DICTATE_SEND_WORDS = [w.strip().lower() for w in
+                      _cfg.get('dictate_send_words', ['send it']) if w.strip()]
+
+
+def _split_send_words(text):
+    """(text, False), or (text without its closing send phrase, True) when
+    it ends with one of DICTATE_SEND_WORDS, punctuation aside."""
+    core = text.rstrip().rstrip('.!?,;: ')
+    low = core.lower()
+    for words in DICTATE_SEND_WORDS:
+        if low == words:
+            return '', True
+        if low.endswith(words) and not low[-len(words) - 1].isalnum():
+            return core[:-len(words)].rstrip(' ,;:'), True
+    return text, False
 # Types whatever text is on the clipboard at the cursor, one character per
 # keystroke. Off unless a key is given.
 TYPE_CLIPBOARD_HOTKEY = _cfg.get('type_clipboard_hotkey', '')
@@ -1550,7 +1568,18 @@ class ClipBridge(rumps.App):
         note.state = 'ready'
         if note.dictate is not None and pin is not None and pin.HAS_AX:
             if pin.trusted():
-                self._start_pin(note, None, note.dictate)
+                send = note.dictate
+                if not send:
+                    words, send = _split_send_words(text)
+                    if send and not words.strip():
+                        # only the send phrase: send what is already typed
+                        self._notes.remove(note)
+                        pin.press(pin._KEY_RETURN)
+                        note.pill.flash('Sent.', 1.2)
+                        self._advance()
+                        return
+                    note.text = words
+                self._start_pin(note, None, send)
                 return
             self._hud_flash('Accessibility is off for ClipBridge.')
         if note is not self._notes[0] or self._paused:
